@@ -664,20 +664,17 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
         return -1;
     }
 
-    /* Set WRITING state before memcpy (brownout detection) */
-    if (h->written != WRITE_STATE_WRITTEN) {
-        h->written = WRITE_STATE_WRITING;
-        h->checksum = hdr_checksum(h);
-    }
+    /* Brownout detection: ALWAYS set WRITING before memcpy */
+    /* This ensures every write operation can be detected if interrupted */
+    h->written = WRITE_STATE_WRITING;
+    h->checksum = hdr_checksum(h);
 
-    /* Perform the write */
+    /* Perform the write - if brownout occurs here, state stays WRITING */
     memcpy((uint8_t *)ptr + offset, src, len);
 
-    /* Set WRITTEN state after memcpy completes */
-    if (h->written == WRITE_STATE_WRITING) {
-        h->written = WRITE_STATE_WRITTEN;
-        h->checksum = hdr_checksum(h);
-    }
+    /* Mark write complete - if brownout occurs here, checksum corrupted */
+    h->written = WRITE_STATE_WRITTEN;
+    h->checksum = hdr_checksum(h);
 
     return (int)len;
 }
