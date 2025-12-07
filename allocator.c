@@ -34,8 +34,10 @@ typedef struct {
     uint32_t written;         /* 1 = data written, 0 = not yet written (brownout detection) */
 } Header;
 
-#define WRITTEN_NO  0
-#define WRITTEN_YES 1
+/* Write commit states for brownout detection */
+#define WRITE_STATE_UNWRITTEN 0    /* Never written - OK to read (free pattern) */
+#define WRITE_STATE_WRITING   1    /* Write in progress - brownout if seen on read */
+#define WRITE_STATE_WRITTEN   2    /* Write completed - OK to read */
 
 /*
  * Block Footer (24 bytes on 64-bit)
@@ -256,7 +258,7 @@ int mm_init(uint8_t *heap, size_t size) {
     Header *h = (Header *)heap;
     size_t block_size = (size / 8) * 8;
 
-    init_header(h, block_size, 0, WRITTEN_YES);
+    init_header(h, block_size, 0, WRITE_STATE_WRITTEN);
     init_footer(h);
 
     /* Set up free links first */
@@ -326,7 +328,7 @@ static void split_block(Header *h, size_t needed) {
 
     /* Create new free block */
     Header *new_h = (Header *)((uint8_t *)h + needed);
-    init_header(new_h, new_size, 0, WRITTEN_YES);
+    init_header(new_h, new_size, 0, WRITE_STATE_WRITTEN);
     init_footer(new_h);
 
     /* Fill data area with pattern (skip FreeLinks at start) */
@@ -375,7 +377,7 @@ static void coalesce(void) {
             list_remove(next_h);
 
             size_t combined = h->size + next_h->size;
-            init_header(h, combined, 0, WRITTEN_YES);
+            init_header(h, combined, 0, WRITE_STATE_WRITTEN);
             init_footer(h);
 
             /* Fill payload with pattern (after free list pointers) */
@@ -418,8 +420,8 @@ void *mm_malloc(size_t size) {
     list_remove(h);
     split_block(h, block_size);
 
-    /* Mark as allocated with pending write (brownout detection) */
-    init_header(h, h->size, 1, WRITTEN_NO);
+    /* Mark as allocated - initially unwritten (brownout detection) */
+    init_header(h, h->size, 1, WRITE_STATE_UNWRITTEN);
     init_footer(h);
 
     stat_allocated += h->size;
@@ -445,11 +447,13 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
 
     if (!h->allocated) return -1;
 
-    /* Brownout detection: check if data was written */
-    if (h->written != WRITTEN_YES) {
+    /* Brownout detection: check write commit state */
+    if (h->written == WRITE_STATE_WRITING) {
+        /* Write was in progress but interrupted - brownout detected */
         stat_corruptions++;
         return -1;
     }
+    /* WRITE_STATE_UNWRITTEN and WRITE_STATE_WRITTEN are both OK to read */
 
     size_t cap = get_capacity(h);
     if (offset >= cap || len > cap - offset) {
@@ -480,11 +484,18 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
         return -1;
     }
 
+    /* Brownout detection: mark write in progress BEFORE the memcpy */
+    if (h->written != WRITE_STATE_WRITTEN) {
+        h->written = WRITE_STATE_WRITING;
+        h->checksum = hdr_checksum(h);
+    }
+
+    /* Perform the actual write */
     memcpy((uint8_t *)ptr + offset, src, len);
 
-    /* Mark block as written (for brownout detection) */
-    if (h->written != WRITTEN_YES) {
-        h->written = WRITTEN_YES;
+    /* Mark write as complete AFTER the memcpy */
+    if (h->written == WRITE_STATE_WRITING) {
+        h->written = WRITE_STATE_WRITTEN;
         h->checksum = hdr_checksum(h);
     }
 
@@ -508,7 +519,7 @@ void mm_free(void *ptr) {
     stat_allocated -= h->size;
 
     /* Mark as free */
-    init_header(h, h->size, 0, WRITTEN_YES);
+    init_header(h, h->size, 0, WRITE_STATE_WRITTEN);
     init_footer(h);
 
     /* Add to free list first (so FreeLinks are set) */
@@ -550,10 +561,10 @@ void *mm_realloc(void *ptr, size_t new_size) {
     size_t copy_size = (old_cap < new_size) ? old_cap : new_size;
     memcpy(new_ptr, ptr, copy_size);
 
-    /* Mark new block as written */
+    /* Mark new block as written (data was copied) */
     Header *new_h = find_header(new_ptr);
-    if (new_h && new_h->written != WRITTEN_YES) {
-        new_h->written = WRITTEN_YES;
+    if (new_h && new_h->written != WRITE_STATE_WRITTEN) {
+        new_h->written = WRITE_STATE_WRITTEN;
         new_h->checksum = hdr_checksum(new_h);
     }
 
