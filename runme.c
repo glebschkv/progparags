@@ -29,601 +29,449 @@
 #include <time.h>
 #include "allocator.h"
 
-/*===========================================================================*/
-/*                          CONFIGURATION CONSTANTS                           */
-/*===========================================================================*/
-
-/** Default heap size in bytes */
+/* Default heap size in bytes */
 #define DEFAULT_HEAP_SIZE 8192
 
-/** Default random seed for reproducible tests */
+/* Default random seed for reproducible tests */
 #define DEFAULT_SEED 42
 
-/** Default storm level (0 = no storms) */
+/* Default storm level (0 = no storms) */
 #define DEFAULT_STORM_LEVEL 0
 
-/** Maximum allowed heap size */
+/* Maximum allowed heap size */
 #define MAX_HEAP_SIZE 1048576
 
-/** Maximum number of concurrent allocations to track */
+/* Maximum number of concurrent allocations to track */
 #define MAX_POINTERS 1000
 
-/*===========================================================================*/
-/*                          GLOBAL TEST STATE                                 */
-/*===========================================================================*/
-
-/** Static heap buffer - allocated once, passed to mm_init */
+/* Static heap buffer - allocated once, passed to mm_init */
 static uint8_t g_heap[MAX_HEAP_SIZE];
 
-/** Array of active allocation pointers */
+/* Array of active allocation pointers */
 static void *g_ptrs[MAX_POINTERS];
 
-/** Array of allocation sizes corresponding to g_ptrs */
+/* Array of allocation sizes corresponding to g_ptrs */
 static size_t g_sizes[MAX_POINTERS];
 
-/*===========================================================================*/
-/*                          CONFIGURATION STRUCTURE                           */
-/*===========================================================================*/
-
-/**
- * @struct Config
- * @brief Holds test configuration parameters
- */
+/* Holds test configuration parameters */
 typedef struct {
-    size_t heap_size;      /**< Size of the test heap in bytes */
-    unsigned int seed;     /**< Random seed for reproducibility */
-    int storm_level;       /**< Storm intensity: 0=none, 1=light, 2=heavy */
-    int num_ops;           /**< Number of random operations to perform */
+  size_t heap_size;
+  unsigned int seed;
+  int storm_level;
+  int num_ops;
 } Config;
 
-/*===========================================================================*/
-/*                          UTILITY FUNCTIONS                                 */
-/*===========================================================================*/
-
-/**
- * @brief Prints usage information for the test executable.
- *
- * @param name Program name (from argv[0])
- */
-static void print_usage(const char *name)
-{
-    printf("Usage: %s [OPTIONS]\n", name);
-    printf("Options:\n");
-    printf("  --size <bytes>   Heap size (default: %d, range: 1024-%d)\n",
-           DEFAULT_HEAP_SIZE, MAX_HEAP_SIZE);
-    printf("  --seed <num>     Random seed (default: %d)\n", DEFAULT_SEED);
-    printf("  --storm <level>  Storm level: 0=none, 1=light, 2=heavy\n");
-    printf("  --ops <num>      Number of operations (default: 0)\n");
-    printf("  --help           Show this message\n");
+/* Prints usage information for the test executable */
+static void print_usage(const char *name) {
+  printf("Usage: %s [OPTIONS]\n", name);
+  printf("Options:\n");
+  printf("  --size <bytes>   Heap size (default: %d, range: 1024-%d)\n",
+         DEFAULT_HEAP_SIZE, MAX_HEAP_SIZE);
+  printf("  --seed <num>     Random seed (default: %d)\n", DEFAULT_SEED);
+  printf("  --storm <level>  Storm level: 0=none, 1=light, 2=heavy\n");
+  printf("  --ops <num>      Number of operations (default: 0)\n");
+  printf("  --help           Show this message\n");
 }
 
-/**
- * @brief Parses command-line arguments into configuration structure.
- *
- * @param argc Argument count
- * @param argv Argument vector
- * @param cfg  Configuration structure to populate
- */
-static void parse_args(int argc, char *argv[], Config *cfg)
-{
-    int c;
-    int idx = 0;
-
-    /* Set default values */
-    cfg->heap_size = DEFAULT_HEAP_SIZE;
-    cfg->seed = DEFAULT_SEED;
-    cfg->storm_level = DEFAULT_STORM_LEVEL;
-    cfg->num_ops = 0;
-
-    /* Define long options */
-    static struct option opts[] = {
-        {"size",  required_argument, 0, 's'},
-        {"seed",  required_argument, 0, 'r'},
-        {"storm", required_argument, 0, 't'},
-        {"ops",   required_argument, 0, 'o'},
-        {"help",  no_argument,       0, 'h'},
-        {0, 0, 0, 0}
-    };
-
-    /* Parse arguments */
-    while ((c = getopt_long(argc, argv, "s:r:t:o:h", opts, &idx)) != -1) {
-        switch (c) {
-            case 's':
-                cfg->heap_size = (size_t)atoi(optarg);
-                if (cfg->heap_size < 1024 || cfg->heap_size > MAX_HEAP_SIZE) {
-                    printf("Error: size must be 1024-%d\n", MAX_HEAP_SIZE);
-                    exit(1);
-                }
-                break;
-
-            case 'r':
-                cfg->seed = (unsigned int)atoi(optarg);
-                break;
-
-            case 't':
-                cfg->storm_level = atoi(optarg);
-                if (cfg->storm_level < 0 || cfg->storm_level > 2) {
-                    printf("Error: storm must be 0, 1, or 2\n");
-                    exit(1);
-                }
-                break;
-
-            case 'o':
-                cfg->num_ops = atoi(optarg);
-                if (cfg->num_ops < 0 || cfg->num_ops > MAX_POINTERS) {
-                    printf("Error: ops must be 0-%d\n", MAX_POINTERS);
-                    exit(1);
-                }
-                break;
-
-            case 'h':
-                print_usage(argv[0]);
-                exit(0);
-
-            default:
-                print_usage(argv[0]);
-                exit(1);
+/* Parses command-line arguments into configuration structure */
+static void parse_args(int argc, char *argv[], Config *cfg) {
+  int c;
+  int idx = 0;
+  static struct option opts[] = {
+    {"size",  required_argument, 0, 's'},
+    {"seed",  required_argument, 0, 'r'},
+    {"storm", required_argument, 0, 't'},
+    {"ops",   required_argument, 0, 'o'},
+    {"help",  no_argument,       0, 'h'},
+    {0, 0, 0, 0}
+  };
+  cfg->heap_size = DEFAULT_HEAP_SIZE;
+  cfg->seed = DEFAULT_SEED;
+  cfg->storm_level = DEFAULT_STORM_LEVEL;
+  cfg->num_ops = 0;
+  while ((c = getopt_long(argc, argv, "s:r:t:o:h", opts, &idx)) != -1) {
+    switch (c) {
+      case 's':
+        cfg->heap_size = (size_t)atoi(optarg);
+        if (cfg->heap_size < 1024 || cfg->heap_size > MAX_HEAP_SIZE) {
+          printf("Error: size must be 1024-%d\n", MAX_HEAP_SIZE);
+          exit(1);
         }
+        break;
+      case 'r':
+        cfg->seed = (unsigned int)atoi(optarg);
+        break;
+      case 't':
+        cfg->storm_level = atoi(optarg);
+        if (cfg->storm_level < 0 || cfg->storm_level > 2) {
+          printf("Error: storm must be 0, 1, or 2\n");
+          exit(1);
+        }
+        break;
+      case 'o':
+        cfg->num_ops = atoi(optarg);
+        if (cfg->num_ops < 0 || cfg->num_ops > MAX_POINTERS) {
+          printf("Error: ops must be 0-%d\n", MAX_POINTERS);
+          exit(1);
+        }
+        break;
+      case 'h':
+        print_usage(argv[0]);
+        exit(0);
+      default:
+        print_usage(argv[0]);
+        exit(1);
     }
+  }
 }
 
-/**
- * @brief Flips a random bit in the heap to simulate radiation.
- *
- * @param heap  Pointer to the heap buffer
- * @param size  Size of the heap in bytes
- * @param seedp Pointer to the random seed (for rand_r)
- */
-static void flip_bit(uint8_t *heap, size_t size, unsigned int *seedp)
-{
-    size_t pos = (size_t)rand_r(seedp) % size;
-    int bit = rand_r(seedp) % 8;
-
-    heap[pos] ^= (uint8_t)(1 << bit);
+/* Flips a random bit in the heap to simulate radiation */
+static void flip_bit(uint8_t *heap, size_t size, unsigned int *seedp) {
+  size_t pos = (size_t)rand_r(seedp) % size;
+  int bit = rand_r(seedp) % 8;
+  heap[pos] ^= (uint8_t)(1 << bit);
 }
 
-/*===========================================================================*/
-/*                          TEST FUNCTIONS                                    */
-/*===========================================================================*/
+/* Runs basic functionality tests */
+static void run_basic_tests(void) {
+  printf("\n=== Basic Tests ===\n");
 
-/**
- * @brief Runs basic functionality tests.
- *
- * Tests include:
- * - Simple allocation and free
- * - Multiple allocations
- * - Large allocations
- * - Zero-size allocation handling
- * - Double-free detection
- * - Realloc functionality
- * - 40-byte alignment verification
- * - Bounds checking
- */
-static void run_basic_tests(void)
-{
-    printf("\n=== Basic Tests ===\n");
-
-    /* Test 1: Simple allocation and read/write */
-    printf("Test 1: Simple allocation... ");
-    fflush(stdout);
-    {
-        void *p1 = mm_malloc(128);
-        if (p1 != NULL) {
-            const char *msg = "Hello Mars!";
-            if (mm_write(p1, 0, msg, strlen(msg) + 1) > 0) {
-                char buf[128];
-                if (mm_read(p1, 0, buf, strlen(msg) + 1) > 0) {
-                    if (strcmp(buf, msg) == 0) {
-                        printf("PASS\n");
-                    } else {
-                        printf("FAIL (data mismatch)\n");
-                    }
-                } else {
-                    printf("FAIL (read failed)\n");
-                }
-            } else {
-                printf("FAIL (write failed)\n");
-            }
-            mm_free(p1);
-        } else {
-            printf("FAIL (allocation failed)\n");
-        }
-    }
-
-    /* Test 2: Multiple allocations */
-    printf("Test 2: Multiple allocations... ");
-    fflush(stdout);
-    {
-        void *ptrs[10];
-        int ok = 1;
-        int i;
-
-        for (i = 0; i < 10; i++) {
-            ptrs[i] = mm_malloc((size_t)(64 + i * 10));
-            if (ptrs[i] == NULL) {
-                ok = 0;
-                break;
-            }
-        }
-
-        if (ok) {
-            /* Free in reverse order */
-            for (i = 9; i >= 0; i--) {
-                mm_free(ptrs[i]);
-            }
+  /* Test 1: Simple allocation and read/write */
+  printf("Test 1: Simple allocation... ");
+  fflush(stdout);
+  {
+    void *p1 = mm_malloc(128);
+    if (p1 != NULL) {
+      const char *msg = "Hello Mars!";
+      if (mm_write(p1, 0, msg, strlen(msg) + 1) > 0) {
+        char buf[128];
+        if (mm_read(p1, 0, buf, strlen(msg) + 1) > 0) {
+          if (strcmp(buf, msg) == 0) {
             printf("PASS\n");
+          } else {
+            printf("FAIL (data mismatch)\n");
+          }
         } else {
-            printf("FAIL\n");
-            /* Clean up any successful allocations */
-            for (i = 0; i < 10; i++) {
-                if (ptrs[i] != NULL) {
-                    mm_free(ptrs[i]);
-                }
-            }
+          printf("FAIL (read failed)\n");
         }
+      } else {
+        printf("FAIL (write failed)\n");
+      }
+      mm_free(p1);
+    } else {
+      printf("FAIL (allocation failed)\n");
     }
+  }
 
-    /* Test 3: Large allocation */
-    printf("Test 3: Large allocation... ");
-    fflush(stdout);
-    {
-        void *large = mm_malloc(2000);
-        if (large != NULL) {
-            mm_free(large);
-            printf("PASS\n");
-        } else {
-            printf("FAIL\n");
-        }
-    }
-
-    /* Test 4: Zero-size allocation should return NULL */
-    printf("Test 4: Zero-size allocation... ");
-    fflush(stdout);
-    {
-        void *zero = mm_malloc(0);
-        if (zero == NULL) {
-            printf("PASS\n");
-        } else {
-            printf("FAIL\n");
-            mm_free(zero);
-        }
-    }
-
-    /* Test 5: Double-free detection */
-    printf("Test 5: Double-free detection... ");
-    fflush(stdout);
-    {
-        void *df = mm_malloc(100);
-        if (df != NULL) {
-            mm_free(df);
-            mm_free(df);  /* Should not crash */
-            printf("PASS\n");
-        } else {
-            printf("FAIL (allocation failed)\n");
-        }
-    }
-
-    /* Test 6: Realloc functionality */
-    printf("Test 6: Realloc... ");
-    fflush(stdout);
-    {
-        void *rp = mm_malloc(50);
-        if (rp != NULL) {
-            const char *data = "Realloc test";
-            mm_write(rp, 0, data, strlen(data) + 1);
-
-            void *rp2 = mm_realloc(rp, 200);
-            if (rp2 != NULL) {
-                char rbuf[128];
-                mm_read(rp2, 0, rbuf, strlen(data) + 1);
-                if (strcmp(rbuf, data) == 0) {
-                    printf("PASS\n");
-                } else {
-                    printf("FAIL (data not preserved)\n");
-                }
-                mm_free(rp2);
-            } else {
-                printf("FAIL (realloc failed)\n");
-                mm_free(rp);
-            }
-        } else {
-            printf("FAIL (allocation failed)\n");
-        }
-    }
-
-    /* Test 7: 40-byte alignment verification */
-    printf("Test 7: 40-byte alignment... ");
-    fflush(stdout);
-    {
-        int align_ok = 1;
-        int i;
-
-        for (i = 0; i < 5; i++) {
-            void *ap = mm_malloc((size_t)(32 + i * 17));
-            if (ap != NULL) {
-                size_t offset = (size_t)((uint8_t *)ap - g_heap);
-                if (offset % 40 != 0) {
-                    align_ok = 0;
-                }
-                mm_free(ap);
-            }
-        }
-
-        if (align_ok) {
-            printf("PASS\n");
-        } else {
-            printf("FAIL\n");
-        }
-    }
-
-    /* Test 8: Bounds checking */
-    printf("Test 8: Bounds checking... ");
-    fflush(stdout);
-    {
-        void *bp = mm_malloc(64);
-        if (bp != NULL) {
-            char buf[128];
-            int r = mm_read(bp, 100, buf, 10);  /* Out of bounds */
-            if (r == -1) {
-                printf("PASS\n");
-            } else {
-                printf("FAIL\n");
-            }
-            mm_free(bp);
-        } else {
-            printf("FAIL (allocation failed)\n");
-        }
-    }
-}
-
-/**
- * @brief Runs random allocation/free operations.
- *
- * @param num_ops Number of operations to perform
- * @param seedp   Pointer to random seed
- */
-static void run_ops_test(int num_ops, unsigned int *seedp)
-{
-    int active = 0;
-    int allocs = 0;
-    int frees = 0;
-    int op;
+  /* Test 2: Multiple allocations */
+  printf("Test 2: Multiple allocations... ");
+  fflush(stdout);
+  {
+    void *ptrs[10];
+    int ok = 1;
     int i;
-    int max;
-
-    printf("\n=== Operations Test (%d ops) ===\n", num_ops);
-    fflush(stdout);
-
-    /* Initialize pointer array */
-    for (i = 0; i < MAX_POINTERS; i++) {
-        g_ptrs[i] = NULL;
-        g_sizes[i] = 0;
+    for (i = 0; i < 10; i++) {
+      ptrs[i] = mm_malloc((size_t)(64 + i * 10));
+      if (ptrs[i] == NULL) {
+        ok = 0;
+        break;
+      }
     }
-
-    /* Perform random operations */
-    for (op = 0; op < num_ops; op++) {
-        int action = rand_r(seedp) % 3;
-
-        if (action < 2 && active < MAX_POINTERS / 2) {
-            /* Allocate */
-            size_t size = 16 + ((size_t)rand_r(seedp) % 512);
-            int idx = -1;
-
-            /* Find free slot */
-            for (i = 0; i < num_ops && i < MAX_POINTERS; i++) {
-                if (g_ptrs[i] == NULL) {
-                    idx = i;
-                    break;
-                }
-            }
-
-            if (idx >= 0) {
-                g_ptrs[idx] = mm_malloc(size);
-                if (g_ptrs[idx] != NULL) {
-                    g_sizes[idx] = size;
-                    active++;
-                    allocs++;
-
-                    /* Write pattern to verify later */
-                    uint8_t pat = (uint8_t)(idx & 0xFF);
-                    size_t j;
-                    for (j = 0; j < size; j++) {
-                        mm_write(g_ptrs[idx], j, &pat, 1);
-                    }
-                }
-            }
-        } else if (active > 0) {
-            /* Free a random allocation */
-            max = (num_ops < MAX_POINTERS) ? num_ops : MAX_POINTERS;
-
-            int tries;
-            for (tries = 0; tries < max; tries++) {
-                int idx = rand_r(seedp) % max;
-                if (g_ptrs[idx] != NULL) {
-                    mm_free(g_ptrs[idx]);
-                    g_ptrs[idx] = NULL;
-                    g_sizes[idx] = 0;
-                    active--;
-                    frees++;
-                    break;
-                }
-            }
+    if (ok) {
+      for (i = 9; i >= 0; i--) {
+        mm_free(ptrs[i]);
+      }
+      printf("PASS\n");
+    } else {
+      printf("FAIL\n");
+      for (i = 0; i < 10; i++) {
+        if (ptrs[i] != NULL) {
+          mm_free(ptrs[i]);
         }
+      }
     }
+  }
 
-    /* Cleanup remaining allocations */
-    max = (num_ops < MAX_POINTERS) ? num_ops : MAX_POINTERS;
-    for (i = 0; i < max; i++) {
-        if (g_ptrs[i] != NULL) {
-            mm_free(g_ptrs[i]);
-            g_ptrs[i] = NULL;
-            frees++;
+  /* Test 3: Large allocation */
+  printf("Test 3: Large allocation... ");
+  fflush(stdout);
+  {
+    void *large = mm_malloc(2000);
+    if (large != NULL) {
+      mm_free(large);
+      printf("PASS\n");
+    } else {
+      printf("FAIL\n");
+    }
+  }
+
+  /* Test 4: Zero-size allocation should return NULL */
+  printf("Test 4: Zero-size allocation... ");
+  fflush(stdout);
+  {
+    void *zero = mm_malloc(0);
+    if (zero == NULL) {
+      printf("PASS\n");
+    } else {
+      printf("FAIL\n");
+      mm_free(zero);
+    }
+  }
+
+  /* Test 5: Double-free detection */
+  printf("Test 5: Double-free detection... ");
+  fflush(stdout);
+  {
+    void *df = mm_malloc(100);
+    if (df != NULL) {
+      mm_free(df);
+      mm_free(df);
+      printf("PASS\n");
+    } else {
+      printf("FAIL (allocation failed)\n");
+    }
+  }
+
+  /* Test 6: Realloc functionality */
+  printf("Test 6: Realloc... ");
+  fflush(stdout);
+  {
+    void *rp = mm_malloc(50);
+    if (rp != NULL) {
+      const char *data = "Realloc test";
+      void *rp2;
+      mm_write(rp, 0, data, strlen(data) + 1);
+      rp2 = mm_realloc(rp, 200);
+      if (rp2 != NULL) {
+        char rbuf[128];
+        mm_read(rp2, 0, rbuf, strlen(data) + 1);
+        if (strcmp(rbuf, data) == 0) {
+          printf("PASS\n");
+        } else {
+          printf("FAIL (data not preserved)\n");
         }
+        mm_free(rp2);
+      } else {
+        printf("FAIL (realloc failed)\n");
+        mm_free(rp);
+      }
+    } else {
+      printf("FAIL (allocation failed)\n");
     }
+  }
 
-    printf("Completed: %d allocs, %d frees\n", allocs, frees);
+  /* Test 7: 40-byte alignment verification */
+  printf("Test 7: 40-byte alignment... ");
+  fflush(stdout);
+  {
+    int align_ok = 1;
+    int i;
+    for (i = 0; i < 5; i++) {
+      void *ap = mm_malloc((size_t)(32 + i * 17));
+      if (ap != NULL) {
+        size_t offset = (size_t)((uint8_t *)ap - g_heap);
+        if (offset % 40 != 0) {
+          align_ok = 0;
+        }
+        mm_free(ap);
+      }
+    }
+    if (align_ok) {
+      printf("PASS\n");
+    } else {
+      printf("FAIL\n");
+    }
+  }
+
+  /* Test 8: Bounds checking */
+  printf("Test 8: Bounds checking... ");
+  fflush(stdout);
+  {
+    void *bp = mm_malloc(64);
+    if (bp != NULL) {
+      char buf[128];
+      int r = mm_read(bp, 100, buf, 10);
+      if (r == -1) {
+        printf("PASS\n");
+      } else {
+        printf("FAIL\n");
+      }
+      mm_free(bp);
+    } else {
+      printf("FAIL (allocation failed)\n");
+    }
+  }
 }
 
-/**
- * @brief Runs storm simulation tests.
- *
- * Simulates radiation storms by flipping random bits in the heap
- * and verifying the allocator detects corruption.
- *
- * @param heap   Pointer to the heap buffer
- * @param size   Size of the heap in bytes
- * @param level  Storm intensity (1=light, 2=heavy)
- * @param seedp  Pointer to random seed
- */
+/* Runs random allocation/free operations */
+static void run_ops_test(int num_ops, unsigned int *seedp) {
+  int active = 0;
+  int allocs = 0;
+  int frees = 0;
+  int op;
+  int i;
+  int max;
+  printf("\n=== Operations Test (%d ops) ===\n", num_ops);
+  fflush(stdout);
+  for (i = 0; i < MAX_POINTERS; i++) {
+    g_ptrs[i] = NULL;
+    g_sizes[i] = 0;
+  }
+  for (op = 0; op < num_ops; op++) {
+    int action = rand_r(seedp) % 3;
+    if (action < 2 && active < MAX_POINTERS / 2) {
+      size_t size = 16 + ((size_t)rand_r(seedp) % 512);
+      int idx = -1;
+      for (i = 0; i < num_ops && i < MAX_POINTERS; i++) {
+        if (g_ptrs[i] == NULL) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx >= 0) {
+        g_ptrs[idx] = mm_malloc(size);
+        if (g_ptrs[idx] != NULL) {
+          uint8_t pat = (uint8_t)(idx & 0xFF);
+          size_t j;
+          g_sizes[idx] = size;
+          active++;
+          allocs++;
+          for (j = 0; j < size; j++) {
+            mm_write(g_ptrs[idx], j, &pat, 1);
+          }
+        }
+      }
+    } else if (active > 0) {
+      int tries;
+      max = (num_ops < MAX_POINTERS) ? num_ops : MAX_POINTERS;
+      for (tries = 0; tries < max; tries++) {
+        int idx = rand_r(seedp) % max;
+        if (g_ptrs[idx] != NULL) {
+          mm_free(g_ptrs[idx]);
+          g_ptrs[idx] = NULL;
+          g_sizes[idx] = 0;
+          active--;
+          frees++;
+          break;
+        }
+      }
+    }
+  }
+  max = (num_ops < MAX_POINTERS) ? num_ops : MAX_POINTERS;
+  for (i = 0; i < max; i++) {
+    if (g_ptrs[i] != NULL) {
+      mm_free(g_ptrs[i]);
+      g_ptrs[i] = NULL;
+      frees++;
+    }
+  }
+  printf("Completed: %d allocs, %d frees\n", allocs, frees);
+}
+
+/* Runs storm simulation tests */
 static void run_storm_tests(uint8_t *heap, size_t size, int level,
-                            unsigned int *seedp)
-{
-    void *p1;
-    void *p2;
-    void *p3;
-    int flips;
-    int i;
-
-    if (level == 0) {
-        return;
+                            unsigned int *seedp) {
+  void *p1;
+  void *p2;
+  void *p3;
+  int flips;
+  int i;
+  if (level == 0) {
+    return;
+  }
+  printf("\n=== Storm Tests (Level %d) ===\n", level);
+  fflush(stdout);
+  p1 = mm_malloc(128);
+  p2 = mm_malloc(256);
+  p3 = mm_malloc(64);
+  if (p1 == NULL || p2 == NULL || p3 == NULL) {
+    printf("Failed to allocate test blocks\n");
+    if (p1 != NULL) mm_free(p1);
+    if (p2 != NULL) mm_free(p2);
+    if (p3 != NULL) mm_free(p3);
+    return;
+  }
+  {
+    const char *msg = "Storm test";
+    mm_write(p1, 0, msg, strlen(msg) + 1);
+  }
+  flips = (level == 1) ? 5 : 20;
+  printf("Simulating %d bit flips... ", flips);
+  fflush(stdout);
+  for (i = 0; i < flips; i++) {
+    flip_bit(heap, size, seedp);
+  }
+  printf("Done\n");
+  printf("Testing corruption detection... ");
+  fflush(stdout);
+  {
+    char buf[256];
+    int r = mm_read(p1, 0, buf, 128);
+    if (r < 0) {
+      printf("Corruption detected\n");
+    } else {
+      printf("Data still readable\n");
     }
-
-    printf("\n=== Storm Tests (Level %d) ===\n", level);
-    fflush(stdout);
-
-    /* Allocate test blocks */
-    p1 = mm_malloc(128);
-    p2 = mm_malloc(256);
-    p3 = mm_malloc(64);
-
-    if (p1 == NULL || p2 == NULL || p3 == NULL) {
-        printf("Failed to allocate test blocks\n");
-        if (p1 != NULL) mm_free(p1);
-        if (p2 != NULL) mm_free(p2);
-        if (p3 != NULL) mm_free(p3);
-        return;
+  }
+  printf("Testing safe free... ");
+  fflush(stdout);
+  mm_free(p1);
+  mm_free(p2);
+  mm_free(p3);
+  printf("PASS\n");
+  printf("Testing recovery... ");
+  fflush(stdout);
+  {
+    void *rec = mm_malloc(100);
+    if (rec != NULL) {
+      mm_free(rec);
+      printf("PASS\n");
+    } else {
+      printf("Limited (heap may be fragmented)\n");
     }
-
-    /* Write test data */
-    {
-        const char *msg = "Storm test";
-        mm_write(p1, 0, msg, strlen(msg) + 1);
-    }
-
-    /* Determine number of bit flips based on storm level */
-    flips = (level == 1) ? 5 : 20;
-
-    printf("Simulating %d bit flips... ", flips);
-    fflush(stdout);
-
-    /* Simulate radiation storm */
-    for (i = 0; i < flips; i++) {
-        flip_bit(heap, size, seedp);
-    }
-    printf("Done\n");
-
-    /* Test corruption detection */
-    printf("Testing corruption detection... ");
-    fflush(stdout);
-    {
-        char buf[256];
-        int r = mm_read(p1, 0, buf, 128);
-        if (r < 0) {
-            printf("Corruption detected\n");
-        } else {
-            printf("Data still readable\n");
-        }
-    }
-
-    /* Test safe free */
-    printf("Testing safe free... ");
-    fflush(stdout);
-    mm_free(p1);
-    mm_free(p2);
-    mm_free(p3);
-    printf("PASS\n");
-
-    /* Test recovery */
-    printf("Testing recovery... ");
-    fflush(stdout);
-    {
-        void *rec = mm_malloc(100);
-        if (rec != NULL) {
-            mm_free(rec);
-            printf("PASS\n");
-        } else {
-            printf("Limited (heap may be fragmented)\n");
-        }
-    }
+  }
 }
 
-/*===========================================================================*/
-/*                          MAIN FUNCTION                                     */
-/*===========================================================================*/
-
-/**
- * @brief Main entry point for the test executable.
- *
- * @param argc Argument count
- * @param argv Argument vector
- * @return 0 on success, 1 on failure
- */
-int main(int argc, char *argv[])
-{
-    Config cfg;
-    unsigned int seed;
-    size_t i;
-
-    /* Parse command-line arguments */
-    parse_args(argc, argv, &cfg);
-
-    /* Print test header */
-    printf("=================================\n");
-    printf(" Mars Rover Memory Allocator Test\n");
-    printf("=================================\n");
-    printf("Heap Size: %zu bytes\n", cfg.heap_size);
-    printf("Seed: %u\n", cfg.seed);
-    printf("Storm Level: %d\n", cfg.storm_level);
-    if (cfg.num_ops > 0) {
-        printf("Operations: %d\n", cfg.num_ops);
-    }
-    fflush(stdout);
-
-    /* Initialize heap with identifiable pattern */
-    for (i = 0; i < cfg.heap_size; i++) {
-        g_heap[i] = (uint8_t)(0xDE + (i % 5));
-    }
-
-    /* Initialize the allocator */
-    printf("\nInitializing allocator... ");
-    fflush(stdout);
-    if (mm_init(g_heap, cfg.heap_size) == 0) {
-        printf("SUCCESS\n");
-    } else {
-        printf("FAILED\n");
-        return 1;
-    }
-    fflush(stdout);
-
-    /* Run tests */
-    seed = cfg.seed;
-
-    if (cfg.num_ops > 0) {
-        run_ops_test(cfg.num_ops, &seed);
-    } else {
-        run_basic_tests();
-    }
-
-    if (cfg.storm_level > 0) {
-        run_storm_tests(g_heap, cfg.heap_size, cfg.storm_level, &seed);
-    }
-
-    /* Print final statistics */
-    printf("\n=== Final Statistics ===\n");
-    mm_heap_stats();
-
-    printf("=== All Tests Complete ===\n");
-    fflush(stdout);
-
-    return 0;
+/* Main entry point for the test executable */
+int main(int argc, char *argv[]) {
+  Config cfg;
+  unsigned int seed;
+  size_t i;
+  parse_args(argc, argv, &cfg);
+  printf("=================================\n");
+  printf(" Mars Rover Memory Allocator Test\n");
+  printf("=================================\n");
+  printf("Heap Size: %zu bytes\n", cfg.heap_size);
+  printf("Seed: %u\n", cfg.seed);
+  printf("Storm Level: %d\n", cfg.storm_level);
+  if (cfg.num_ops > 0) {
+    printf("Operations: %d\n", cfg.num_ops);
+  }
+  fflush(stdout);
+  for (i = 0; i < cfg.heap_size; i++) {
+    g_heap[i] = (uint8_t)(0xDE + (i % 5));
+  }
+  printf("\nInitializing allocator... ");
+  fflush(stdout);
+  if (mm_init(g_heap, cfg.heap_size) == 0) {
+    printf("SUCCESS\n");
+  } else {
+    printf("FAILED\n");
+    return 1;
+  }
+  fflush(stdout);
+  seed = cfg.seed;
+  if (cfg.num_ops > 0) {
+    run_ops_test(cfg.num_ops, &seed);
+  } else {
+    run_basic_tests();
+  }
+  if (cfg.storm_level > 0) {
+    run_storm_tests(g_heap, cfg.heap_size, cfg.storm_level, &seed);
+  }
+  printf("\n=== Final Statistics ===\n");
+  mm_heap_stats();
+  printf("=== All Tests Complete ===\n");
+  fflush(stdout);
+  return 0;
 }
