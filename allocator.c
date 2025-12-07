@@ -3,27 +3,15 @@
  * COMP2221 Systems Programming - Mars Rover Memory Allocator
  * ============================================================================
  *
- * OVERVIEW:
- * This memory allocator is designed for the Mars Perseverance rover to handle
- * radiation-induced bit flips and power brownouts. All allocator metadata
- * lives within a single contiguous memory block provided by the rover's OS.
+ * A fault-tolerant memory allocator designed for Mars rover operations.
+ * Handles radiation-induced bit flips and power brownouts safely.
  *
- * DESIGN PRINCIPLES:
- * 1. Defense in Depth: Multiple validation layers catch corruption early
- * 2. Fail-Safe: Corrupted blocks are quarantined and handled safely
- * 3. Redundancy: Critical size data stored in header, footer, AND backup
- * 4. Brownout Detection: Commit flags detect partial writes
- * 5. Alignment: All payloads are 40-byte aligned relative to heap start
- *
- * MEMORY LAYOUT:
- *   [Header 72B][Payload Data][Footer 32B]
- *
- * CORRUPTION DETECTION:
- * - Magic numbers: Detect complete overwrites
- * - Canary values: Detect buffer overflows into metadata
- * - CRC32 checksums: Robust detection of bit flips
- * - Triple size redundancy: size in header, footer, and backup field
- * - Commit flags: Detect brownout (partial write) events
+ * Key features:
+ * - 40-byte alignment for all payloads
+ * - Header/footer with magic numbers and checksums for corruption detection
+ * - Commit flags for brownout detection
+ * - Redundant size storage for storm resilience
+ * - Explicit free list with coalescing
  *
  * ============================================================================
  */
@@ -34,846 +22,766 @@
 #include <string.h>
 #include "allocator.h"
 
-/* ============================================================================
- * CONFIGURATION CONSTANTS
- * ============================================================================
- */
-
-/* All returned pointers must be 40-byte aligned relative to heap start */
+/* Alignment requirement - all payloads aligned to 40 bytes */
 #define ALIGNMENT 40
 
-/* Minimum payload size to prevent excessive fragmentation */
-#define MIN_PAYLOAD 40
+/* Minimum block data size */
+#define MIN_BLOCK_DATA 80
 
-/* Magic numbers for corruption detection */
-#define MAGIC_HDR 0xDEADBEEFU
-#define MAGIC_FTR 0xCAFEBABEU
-#define MAGIC_COMMIT 0xC0FFEE42U
+/* Magic values for corruption detection */
+#define HDR_MAGIC_VALID   0xDEADBEEFU
+#define HDR_MAGIC_WRITING 0xBEEFDEADU  /* Indicates write in progress */
+#define FTR_MAGIC_VALID   0xCAFEBABEU
+#define CANARY_VALUE      0xABCDEF12U
 
-/* Canary value to detect buffer overflows */
-#define CANARY 0xABCDEF12U
-
-/* Commit status values for brownout detection */
+/* Commit status */
 #define COMMIT_PENDING 0x00000000U
-#define COMMIT_COMPLETE 0x12345678U
+#define COMMIT_DONE    0x12345678U
 
-/* ============================================================================
- * FREE MEMORY PATTERN
- * ============================================================================
+/* Free memory pattern */
+static const uint8_t FREE_PATTERN[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x99};
+
+/*
+ * Block Header - stores all metadata needed to manage and validate a block.
+ *
+ * The checksum is computed such that XOR of all fields (including checksum) == 0
+ * This allows validation without modifying the header.
  */
-static const uint8_t FREE_PAT[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x99};
+typedef struct BlockHdr {
+    uint32_t magic;              /* HDR_MAGIC_VALID when committed */
+    uint32_t canary;             /* CANARY_VALUE */
+    size_t data_size;            /* Size of data area (between header and footer) */
+    size_t data_size_backup;     /* Redundant copy for corruption detection */
+    uint32_t allocated;          /* 1 = allocated, 0 = free */
+    uint32_t commit;             /* COMMIT_DONE when write complete (brownout detection) */
+    uint32_t checksum;           /* XOR checksum (XOR of all fields == 0 when valid) */
+    uint32_t padding;            /* Alignment padding */
+    struct BlockHdr *next_free;  /* Next in free list */
+    struct BlockHdr *prev_free;  /* Previous in free list */
+} BlockHdr;
 
-/* ============================================================================
- * CRC32 TABLE AND FUNCTION
- * ============================================================================
- * Using CRC32 for robust checksum - much better at detecting bit flips
- */
-static uint32_t crc32_table[256];
-static int crc32_init_done = 0;
-
-static void init_crc32_table(void) {
-  if (crc32_init_done) return;
-  for (uint32_t i = 0; i < 256; i++) {
-    uint32_t crc = i;
-    for (int j = 0; j < 8; j++) {
-      if (crc & 1)
-        crc = (crc >> 1) ^ 0xEDB88320U;
-      else
-        crc = crc >> 1;
-    }
-    crc32_table[i] = crc;
-  }
-  crc32_init_done = 1;
-}
-
-static uint32_t calc_crc32(const void *data, size_t len) {
-  const uint8_t *buf = (const uint8_t *)data;
-  uint32_t crc = 0xFFFFFFFFU;
-  for (size_t i = 0; i < len; i++) {
-    crc = crc32_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
-  }
-  return crc ^ 0xFFFFFFFFU;
-}
-
-/* ============================================================================
- * BLOCK HEADER STRUCTURE (72 bytes, 8-byte aligned)
- * ============================================================================
- * Contains redundant storage of critical fields for corruption resilience.
- * Commit flags enable detection of brownout (partial write) events.
- */
-typedef struct Hdr {
-  uint32_t magic;          /* Must be MAGIC_HDR - detects overwrites */
-  uint32_t canary;         /* Must be CANARY - detects overflows */
-  size_t size;             /* Total block size (data area) */
-  size_t size_backup;      /* Backup copy of size for redundancy */
-  uint32_t checksum;       /* CRC32 checksum of header fields */
-  uint32_t is_free;        /* 1 if free, 0 if allocated */
-  uint32_t commit;         /* Commit flag for brownout detection */
-  uint32_t pad;            /* Padding for alignment */
-  struct Hdr *next;        /* Next block in free list */
-  struct Hdr *prev;        /* Previous block in free list */
-} Hdr;
-
-/* ============================================================================
- * BLOCK FOOTER STRUCTURE (32 bytes, 8-byte aligned)
- * ============================================================================
- * Provides redundant storage for size and additional integrity checks.
+/*
+ * Block Footer - provides redundant storage for corruption detection.
  */
 typedef struct {
-  uint32_t magic;          /* Must be MAGIC_FTR */
-  uint32_t canary;         /* Must be CANARY */
-  size_t size;             /* Must match header size */
-  uint32_t checksum;       /* CRC32 checksum of footer fields */
-  uint32_t commit;         /* Must match header commit */
-  uint32_t pad;            /* Padding */
-} Ftr;
+    uint32_t magic;              /* FTR_MAGIC_VALID */
+    uint32_t canary;             /* CANARY_VALUE */
+    size_t data_size;            /* Must match header */
+    uint32_t commit;             /* COMMIT_DONE when write complete */
+    uint32_t checksum;           /* XOR checksum */
+} BlockFtr;
 
-/* ============================================================================
- * GLOBAL ALLOCATOR STATE
- * ============================================================================
- */
+/* Global allocator state */
 static struct {
-  uint8_t *start;          /* Start of managed heap */
-  uint8_t *end;            /* End of managed heap */
-  size_t heap_size;        /* Total heap size in bytes */
-  Hdr *free_list;          /* Head of doubly-linked free list */
-  Hdr *quarantine;         /* Head of quarantined blocks list */
-  size_t quarantine_cnt;   /* Number of quarantined blocks */
-  bool init;               /* True if allocator is initialized */
-  size_t alloc_bytes;      /* Total bytes currently allocated */
-  size_t free_bytes;       /* Total bytes currently free */
-  size_t alloc_count;      /* Number of successful allocations */
-  size_t corrupt_count;    /* Number of corruption detections */
-} g;
-
-/* ============================================================================
- * CHECKSUM FUNCTIONS
- * ============================================================================
- */
+    uint8_t *heap_base;
+    uint8_t *heap_limit;
+    size_t heap_size;
+    BlockHdr *free_list_head;
+    size_t quarantine_count;
+    bool is_initialized;
+    size_t bytes_allocated;
+    size_t bytes_free;
+    size_t total_allocs;
+    size_t corruption_detections;
+} g_alloc;
 
 /*
- * hdr_cs - Calculate header checksum using CRC32
- * @h: Header to checksum
- *
- * Computes CRC32 over critical header fields (excluding checksum and commit).
- * Commit flag is checked separately for brownout detection.
+ * Compute XOR checksum for header - includes all fields except checksum itself.
+ * The checksum value is set so that XOR of all fields including checksum == 0.
  */
-static uint32_t hdr_cs(Hdr *h) {
-  uint8_t buf[32];
-  size_t off = 0;
-
-  /* Pack critical fields for checksumming (NOT including commit) */
-  memcpy(buf + off, &h->magic, 4); off += 4;
-  memcpy(buf + off, &h->canary, 4); off += 4;
-  memcpy(buf + off, &h->size, sizeof(size_t)); off += sizeof(size_t);
-  memcpy(buf + off, &h->size_backup, sizeof(size_t)); off += sizeof(size_t);
-  memcpy(buf + off, &h->is_free, 4); off += 4;
-
-  return calc_crc32(buf, off);
+static uint32_t compute_hdr_xor(BlockHdr *h) {
+    uint32_t cs = 0;
+    cs ^= h->magic;
+    cs ^= h->canary;
+    cs ^= (uint32_t)(h->data_size & 0xFFFFFFFFUL);
+    cs ^= (uint32_t)((h->data_size >> 16) >> 16);  /* Portable 64-bit shift */
+    cs ^= (uint32_t)(h->data_size_backup & 0xFFFFFFFFUL);
+    cs ^= (uint32_t)((h->data_size_backup >> 16) >> 16);
+    cs ^= h->allocated;
+    cs ^= h->commit;
+    cs ^= h->padding;
+    /* Include pointer addresses in checksum for corruption detection */
+    cs ^= (uint32_t)((uintptr_t)h->next_free & 0xFFFFFFFFUL);
+    cs ^= (uint32_t)(((uintptr_t)h->next_free >> 16) >> 16);
+    cs ^= (uint32_t)((uintptr_t)h->prev_free & 0xFFFFFFFFUL);
+    cs ^= (uint32_t)(((uintptr_t)h->prev_free >> 16) >> 16);
+    return cs;
 }
 
 /*
- * ftr_cs - Calculate footer checksum using CRC32
- * @f: Footer to checksum
- *
- * Commit flag is checked separately for brownout detection.
+ * Compute XOR checksum for footer.
  */
-static uint32_t ftr_cs(Ftr *f) {
-  uint8_t buf[20];
-  size_t off = 0;
-
-  /* Pack critical fields (NOT including commit) */
-  memcpy(buf + off, &f->magic, 4); off += 4;
-  memcpy(buf + off, &f->canary, 4); off += 4;
-  memcpy(buf + off, &f->size, sizeof(size_t)); off += sizeof(size_t);
-
-  return calc_crc32(buf, off);
+static uint32_t compute_ftr_xor(BlockFtr *f) {
+    uint32_t cs = 0;
+    cs ^= f->magic;
+    cs ^= f->canary;
+    cs ^= (uint32_t)(f->data_size & 0xFFFFFFFFUL);
+    cs ^= (uint32_t)((f->data_size >> 16) >> 16);
+    cs ^= f->commit;
+    return cs;
 }
 
-/* ============================================================================
- * POINTER AND BLOCK VALIDATION
- * ============================================================================
- */
-
-/*
- * valid_ptr - Check if pointer is within heap bounds
- */
-static bool valid_ptr(void *p) {
-  if (!p) return false;
-  uint8_t *bp = (uint8_t *)p;
-  return bp >= g.start && bp < g.end;
+/* Check if pointer is within heap bounds */
+static bool ptr_in_heap(void *p) {
+    if (!p || !g_alloc.is_initialized) return false;
+    uint8_t *bp = (uint8_t *)p;
+    return bp >= g_alloc.heap_base && bp < g_alloc.heap_limit;
 }
 
-/*
- * get_payload - Get aligned payload pointer from header
- *
- * Ensures payload is 40-byte aligned relative to heap start.
- */
-static void *get_payload(Hdr *h) {
-  uint8_t *raw = (uint8_t *)h + sizeof(Hdr);
-  size_t off = (size_t)(raw - g.start);
-  size_t pad = (off % ALIGNMENT) ? (ALIGNMENT - (off % ALIGNMENT)) : 0;
-  return raw + pad;
+/* Check if a range is within heap bounds */
+static bool range_in_heap(void *start, size_t len) {
+    if (!start || len == 0) return false;
+    uint8_t *s = (uint8_t *)start;
+    uint8_t *e = s + len;
+    return s >= g_alloc.heap_base && e <= g_alloc.heap_limit && s < e;
 }
 
-/*
- * get_footer - Get footer pointer from header
- */
-static Ftr *get_footer(Hdr *h) {
-  return (Ftr *)((uint8_t *)h + sizeof(Hdr) + h->size);
-}
-
-/*
- * payload_size - Get usable payload size
- */
-static size_t payload_size(Hdr *h) {
-  void *p = get_payload(h);
-  size_t pad = (size_t)((uint8_t *)p - (uint8_t *)h - sizeof(Hdr));
-  return h->size - pad;
-}
-
-/*
- * valid_hdr - Validate header integrity
- *
- * Performs multiple checks:
- * 1. Pointer bounds check
- * 2. Magic number verification
- * 3. Canary value verification
- * 4. Size sanity check
- * 5. Size redundancy check (size == size_backup)
- * 6. Commit flag verification (brownout detection)
- * 7. CRC32 checksum verification
- */
-static bool valid_hdr(Hdr *h) {
-  if (!valid_ptr(h)) return false;
-  if (h->magic != MAGIC_HDR) return false;
-  if (h->canary != CANARY) return false;
-  if (h->size == 0 || h->size > g.heap_size) return false;
-
-  /* Check size redundancy - detects partial corruption */
-  if (h->size != h->size_backup) return false;
-
-  /* Check commit flag - detects brownout events */
-  if (h->commit != COMMIT_COMPLETE) return false;
-
-  /* Verify CRC32 checksum */
-  uint32_t stored = h->checksum;
-  h->checksum = 0;
-  uint32_t calc = hdr_cs(h);
-  h->checksum = stored;
-
-  return stored == calc;
-}
-
-/*
- * valid_ftr - Validate footer integrity
- */
-static bool valid_ftr(Ftr *f, Hdr *h) {
-  if (!valid_ptr(f)) return false;
-  if (f->magic != MAGIC_FTR) return false;
-  if (f->canary != CANARY) return false;
-  if (f->size != h->size) return false;
-
-  /* Check commit flag matches header */
-  if (f->commit != h->commit) return false;
-
-  /* Verify CRC32 checksum */
-  uint32_t stored = f->checksum;
-  f->checksum = 0;
-  uint32_t calc = ftr_cs(f);
-  f->checksum = stored;
-
-  return stored == calc;
-}
-
-/*
- * valid_block - Full block validation (header + footer)
- */
-static bool valid_block(Hdr *h) {
-  if (!valid_hdr(h)) return false;
-  Ftr *f = get_footer(h);
-  if ((uint8_t *)f + sizeof(Ftr) > g.end) return false;
-  return valid_ftr(f, h);
-}
-
-/*
- * try_recover_size - Attempt to recover size from redundant fields
- *
- * If one size field is corrupted, use the others.
- * Returns 0 if recovery fails.
- */
-static size_t try_recover_size(Hdr *h) {
-  /* Try each size source */
-  size_t sizes[3] = {0, 0, 0};
-  int valid_count = 0;
-
-  /* Check header size */
-  if (h->size > 0 && h->size <= g.heap_size) {
-    sizes[0] = h->size;
-    valid_count++;
-  }
-
-  /* Check backup size */
-  if (h->size_backup > 0 && h->size_backup <= g.heap_size) {
-    sizes[1] = h->size_backup;
-    valid_count++;
-  }
-
-  /* Try to get footer size if we can guess location */
-  if (sizes[0] > 0) {
-    Ftr *f = (Ftr *)((uint8_t *)h + sizeof(Hdr) + sizes[0]);
-    if (valid_ptr(f) && f->size > 0 && f->size <= g.heap_size) {
-      sizes[2] = f->size;
-      valid_count++;
+/* Get aligned payload pointer from header */
+static void *hdr_to_payload(BlockHdr *h) {
+    uint8_t *raw = (uint8_t *)h + sizeof(BlockHdr);
+    size_t offset_from_base = (size_t)(raw - g_alloc.heap_base);
+    size_t padding = 0;
+    if (offset_from_base % ALIGNMENT != 0) {
+        padding = ALIGNMENT - (offset_from_base % ALIGNMENT);
     }
-  }
+    return raw + padding;
+}
 
-  /* Vote: if at least 2 agree, use that value */
-  if (sizes[0] > 0 && sizes[0] == sizes[1]) return sizes[0];
-  if (sizes[0] > 0 && sizes[0] == sizes[2]) return sizes[0];
-  if (sizes[1] > 0 && sizes[1] == sizes[2]) return sizes[1];
+/* Get footer pointer from header */
+static BlockFtr *hdr_to_ftr(BlockHdr *h) {
+    return (BlockFtr *)((uint8_t *)h + sizeof(BlockHdr) + h->data_size);
+}
 
-  /* Return first valid size */
-  for (int i = 0; i < 3; i++) {
-    if (sizes[i] > 0) return sizes[i];
-  }
+/* Calculate alignment padding for a header */
+static size_t get_alignment_padding(BlockHdr *h) {
+    uint8_t *raw = (uint8_t *)h + sizeof(BlockHdr);
+    size_t offset_from_base = (size_t)(raw - g_alloc.heap_base);
+    if (offset_from_base % ALIGNMENT == 0) return 0;
+    return ALIGNMENT - (offset_from_base % ALIGNMENT);
+}
 
-  return 0;
+/* Get usable payload capacity */
+static size_t get_payload_capacity(BlockHdr *h) {
+    size_t align_pad = get_alignment_padding(h);
+    if (align_pad >= h->data_size) return 0;
+    return h->data_size - align_pad;
 }
 
 /*
- * ptr_to_hdr - Find header for a user pointer
- *
- * Scans heap to find the block containing this pointer.
- * Handles corrupted blocks by attempting recovery.
+ * Finalize header - compute and store checksum.
+ * Sets checksum such that XOR of all fields == 0.
  */
-static Hdr *ptr_to_hdr(void *p) {
-  if (!p || !g.init) return NULL;
-  if (!valid_ptr(p)) return NULL;
+static void finalize_hdr(BlockHdr *h) {
+    h->checksum = 0;
+    h->checksum = compute_hdr_xor(h);  /* Now XOR of all fields == 0 */
+}
 
-  uint8_t *scan = g.start;
-  while (scan + sizeof(Hdr) + sizeof(Ftr) <= g.end) {
-    Hdr *h = (Hdr *)scan;
+/*
+ * Initialize footer with proper values and checksum.
+ */
+static void init_ftr(BlockFtr *f, size_t data_size) {
+    f->magic = FTR_MAGIC_VALID;
+    f->canary = CANARY_VALUE;
+    f->data_size = data_size;
+    f->commit = COMMIT_DONE;
+    f->checksum = 0;
+    f->checksum = compute_ftr_xor(f);  /* Now XOR of all fields == 0 */
+}
 
-    /* Check for valid magic number */
-    if (h->magic == MAGIC_HDR) {
-      /* Try to get a valid size */
-      size_t sz = h->size;
-      if (sz == 0 || sz > g.heap_size) {
-        sz = try_recover_size(h);
-      }
+/*
+ * Validate header - does NOT modify the header.
+ * Returns true if header appears valid and uncorrupted.
+ */
+static bool validate_hdr(BlockHdr *h) {
+    if (!range_in_heap(h, sizeof(BlockHdr))) return false;
 
-      if (sz > 0 && sz <= g.heap_size) {
-        /* Check if this is our block */
-        if (get_payload(h) == p) {
-          return h;
+    /* Check magic - must be valid (not writing) */
+    if (h->magic != HDR_MAGIC_VALID) return false;
+
+    /* Check canary */
+    if (h->canary != CANARY_VALUE) return false;
+
+    /* Check commit status (brownout detection) */
+    if (h->commit != COMMIT_DONE) return false;
+
+    /* Check data size is reasonable */
+    if (h->data_size == 0 || h->data_size > g_alloc.heap_size) return false;
+
+    /* Check redundant size copy matches */
+    if (h->data_size != h->data_size_backup) return false;
+
+    /* Verify checksum: XOR of all fields should be 0 */
+    uint32_t xor_check = compute_hdr_xor(h) ^ h->checksum;
+    return xor_check == 0;
+}
+
+/*
+ * Validate footer - does NOT modify the footer.
+ */
+static bool validate_ftr(BlockFtr *f, BlockHdr *h) {
+    if (!range_in_heap(f, sizeof(BlockFtr))) return false;
+
+    /* Check magic */
+    if (f->magic != FTR_MAGIC_VALID) return false;
+
+    /* Check canary */
+    if (f->canary != CANARY_VALUE) return false;
+
+    /* Check commit status (brownout detection) */
+    if (f->commit != COMMIT_DONE) return false;
+
+    /* Check data size matches header */
+    if (f->data_size != h->data_size) return false;
+
+    /* Verify checksum */
+    uint32_t xor_check = compute_ftr_xor(f) ^ f->checksum;
+    return xor_check == 0;
+}
+
+/*
+ * Validate complete block (header + footer).
+ */
+static bool validate_block(BlockHdr *h) {
+    if (!validate_hdr(h)) return false;
+
+    BlockFtr *f = hdr_to_ftr(h);
+    return validate_ftr(f, h);
+}
+
+/* Write free pattern to payload area */
+static void write_free_pattern(void *ptr, size_t size) {
+    uint8_t *p = (uint8_t *)ptr;
+    for (size_t i = 0; i < size; i++) {
+        p[i] = FREE_PATTERN[i % 5];
+    }
+}
+
+/* Remove block from free list - updates checksums for modified headers */
+static void remove_from_freelist(BlockHdr *h) {
+    BlockHdr *prev_blk = h->prev_free;
+    BlockHdr *next_blk = h->next_free;
+
+    if (prev_blk && ptr_in_heap(prev_blk)) {
+        prev_blk->next_free = next_blk;
+        finalize_hdr(prev_blk);  /* Update checksum after modifying pointer */
+    } else {
+        g_alloc.free_list_head = next_blk;
+    }
+
+    if (next_blk && ptr_in_heap(next_blk)) {
+        next_blk->prev_free = prev_blk;
+        finalize_hdr(next_blk);  /* Update checksum after modifying pointer */
+    }
+
+    h->next_free = NULL;
+    h->prev_free = NULL;
+}
+
+/* Add block to front of free list - updates checksums */
+static void add_to_freelist(BlockHdr *h) {
+    h->next_free = g_alloc.free_list_head;
+    h->prev_free = NULL;
+
+    if (g_alloc.free_list_head && ptr_in_heap(g_alloc.free_list_head)) {
+        g_alloc.free_list_head->prev_free = h;
+        finalize_hdr(g_alloc.free_list_head);  /* Update checksum */
+    }
+
+    g_alloc.free_list_head = h;
+}
+
+/*
+ * Scan heap to find header for a given payload pointer.
+ * This is safer than pointer arithmetic which could be corrupted.
+ */
+static BlockHdr *payload_to_hdr(void *payload) {
+    if (!payload || !g_alloc.is_initialized) return NULL;
+    if (!ptr_in_heap(payload)) return NULL;
+
+    uint8_t *scan = g_alloc.heap_base;
+    size_t max_iterations = g_alloc.heap_size / sizeof(void *);
+    size_t iter = 0;
+
+    while (scan + sizeof(BlockHdr) + sizeof(BlockFtr) <= g_alloc.heap_limit &&
+           iter++ < max_iterations) {
+        BlockHdr *h = (BlockHdr *)scan;
+
+        /* Check if this looks like a valid header */
+        if ((h->magic == HDR_MAGIC_VALID || h->magic == HDR_MAGIC_WRITING) &&
+            h->data_size > 0 && h->data_size <= g_alloc.heap_size) {
+
+            /* Check if this header's payload matches what we're looking for */
+            if (hdr_to_payload(h) == payload) {
+                return h;
+            }
+
+            /* Move to next block */
+            size_t block_total = sizeof(BlockHdr) + h->data_size + sizeof(BlockFtr);
+            if (scan + block_total <= g_alloc.heap_limit) {
+                scan += block_total;
+                continue;
+            }
         }
-        /* Move to next block */
-        size_t total = sizeof(Hdr) + sz + sizeof(Ftr);
-        if (scan + total <= g.end) {
-          scan += total;
-          continue;
+
+        /* Fallback: step forward slowly */
+        scan += sizeof(void *);
+    }
+
+    return NULL;
+}
+
+/* Round up to multiple of given value */
+static size_t round_up(size_t val, size_t mult) {
+    return ((val + mult - 1) / mult) * mult;
+}
+
+/*
+ * Find a free block with at least 'needed' bytes of data space.
+ * Removes corrupted blocks from the free list.
+ */
+static BlockHdr *find_free_block(size_t needed) {
+    BlockHdr *cur = g_alloc.free_list_head;
+    BlockHdr *prev = NULL;
+    size_t max_iter = g_alloc.heap_size / sizeof(void *);
+    size_t iter = 0;
+
+    while (cur && iter++ < max_iter) {
+        if (!ptr_in_heap(cur)) {
+            /* Corrupted pointer - fix the list */
+            if (prev) {
+                prev->next_free = NULL;
+                finalize_hdr(prev);
+            } else {
+                g_alloc.free_list_head = NULL;
+            }
+            break;
         }
-      }
+
+        BlockHdr *next = cur->next_free;
+
+        /* Validate current block */
+        if (!validate_block(cur)) {
+            /* Corrupted - remove from list */
+            g_alloc.corruption_detections++;
+            g_alloc.quarantine_count++;
+
+            if (prev) {
+                prev->next_free = next;
+                finalize_hdr(prev);
+            } else {
+                g_alloc.free_list_head = next;
+            }
+
+            if (next && ptr_in_heap(next)) {
+                next->prev_free = prev;
+                finalize_hdr(next);
+            }
+
+            cur = next;
+            continue;
+        }
+
+        /* Check if block is free and large enough */
+        if (!cur->allocated && cur->data_size >= needed) {
+            return cur;
+        }
+
+        prev = cur;
+        cur = next;
     }
 
-    /* Skip forward - try to find next valid header */
-    scan += 8;
-  }
-  return NULL;
+    return NULL;
 }
 
 /*
- * write_pat - Write free pattern to memory
+ * Split a block if it's significantly larger than needed.
+ * Creates a new free block from the remainder.
  */
-static void write_pat(void *p, size_t n) {
-  uint8_t *bp = (uint8_t *)p;
-  for (size_t i = 0; i < n; i++) {
-    bp[i] = FREE_PAT[i % 5];
-  }
+static void split_block(BlockHdr *h, size_t needed) {
+    size_t min_split = sizeof(BlockHdr) + MIN_BLOCK_DATA + sizeof(BlockFtr);
+
+    if (h->data_size < needed + min_split) {
+        return;  /* Not enough space to split */
+    }
+
+    /* Calculate new block location and size */
+    size_t new_data_size = h->data_size - needed - sizeof(BlockHdr) - sizeof(BlockFtr);
+    uint8_t *new_loc = (uint8_t *)h + sizeof(BlockHdr) + needed + sizeof(BlockFtr);
+
+    /* Initialize new block header (mark as writing first) */
+    BlockHdr *new_h = (BlockHdr *)new_loc;
+    new_h->magic = HDR_MAGIC_WRITING;  /* Mark as in-progress */
+    new_h->canary = CANARY_VALUE;
+    new_h->data_size = new_data_size;
+    new_h->data_size_backup = new_data_size;
+    new_h->allocated = 0;
+    new_h->commit = COMMIT_PENDING;
+    new_h->padding = 0;
+    new_h->next_free = NULL;
+    new_h->prev_free = NULL;
+
+    /* Initialize footer */
+    init_ftr(hdr_to_ftr(new_h), new_data_size);
+
+    /* Mark header as complete */
+    new_h->commit = COMMIT_DONE;
+    new_h->magic = HDR_MAGIC_VALID;
+    finalize_hdr(new_h);
+
+    /* Fill with free pattern */
+    write_free_pattern(hdr_to_payload(new_h), get_payload_capacity(new_h));
+
+    /* Update original block */
+    h->data_size = needed;
+    h->data_size_backup = needed;
+    finalize_hdr(h);
+    init_ftr(hdr_to_ftr(h), needed);
+
+    /* Add new block to free list */
+    add_to_freelist(new_h);
+    finalize_hdr(new_h);  /* Update checksum after adding to list */
 }
 
 /*
- * fin_hdr - Finalize header with checksum
+ * Coalesce adjacent free blocks.
+ * Walks the heap linearly and merges consecutive free blocks.
  */
-static void fin_hdr(Hdr *h) {
-  h->checksum = 0;
-  h->checksum = hdr_cs(h);
+static void coalesce_blocks(void) {
+    uint8_t *scan = g_alloc.heap_base;
+    size_t max_iter = g_alloc.heap_size / sizeof(void *);
+    size_t iter = 0;
+
+    while (scan + sizeof(BlockHdr) + sizeof(BlockFtr) <= g_alloc.heap_limit &&
+           iter++ < max_iter) {
+
+        BlockHdr *cur = (BlockHdr *)scan;
+
+        /* Check if this looks like a valid block */
+        if (cur->magic != HDR_MAGIC_VALID || cur->data_size == 0 ||
+            cur->data_size > g_alloc.heap_size) {
+            scan += sizeof(void *);
+            continue;
+        }
+
+        if (!validate_block(cur)) {
+            scan += sizeof(void *);
+            continue;
+        }
+
+        /* Find next block */
+        size_t block_total = sizeof(BlockHdr) + cur->data_size + sizeof(BlockFtr);
+        uint8_t *next_addr = scan + block_total;
+
+        if (next_addr + sizeof(BlockHdr) + sizeof(BlockFtr) > g_alloc.heap_limit) {
+            break;
+        }
+
+        BlockHdr *next = (BlockHdr *)next_addr;
+
+        if (next->magic != HDR_MAGIC_VALID || next->data_size == 0 ||
+            next->data_size > g_alloc.heap_size) {
+            scan = next_addr;
+            continue;
+        }
+
+        if (!validate_block(next)) {
+            scan = next_addr;
+            continue;
+        }
+
+        /* If both blocks are free, merge them */
+        if (!cur->allocated && !next->allocated) {
+            /* Remove next from free list */
+            remove_from_freelist(next);
+
+            /* Combine sizes: cur data + header + footer + next data */
+            size_t combined = cur->data_size + sizeof(BlockHdr) + sizeof(BlockFtr) + next->data_size;
+
+            /* Update current block */
+            cur->magic = HDR_MAGIC_WRITING;
+            cur->data_size = combined;
+            cur->data_size_backup = combined;
+            cur->commit = COMMIT_DONE;
+            cur->magic = HDR_MAGIC_VALID;
+            finalize_hdr(cur);
+
+            init_ftr(hdr_to_ftr(cur), combined);
+            write_free_pattern(hdr_to_payload(cur), get_payload_capacity(cur));
+
+            /* Don't advance scan - check if we can merge with next block too */
+            continue;
+        }
+
+        scan = next_addr;
+    }
 }
 
 /*
- * fin_ftr - Finalize footer with all fields
- */
-static void fin_ftr(Ftr *f, size_t sz, uint32_t commit) {
-  f->magic = MAGIC_FTR;
-  f->canary = CANARY;
-  f->size = sz;
-  f->commit = commit;
-  f->checksum = 0;
-  f->checksum = ftr_cs(f);
-}
-
-/*
- * list_rm - Remove block from free list
- */
-static void list_rm(Hdr *h) {
-  if (h->prev) h->prev->next = h->next;
-  else g.free_list = h->next;
-  if (h->next) h->next->prev = h->prev;
-  h->next = h->prev = NULL;
-}
-
-/*
- * list_add - Add block to front of free list
- */
-static void list_add(Hdr *h) {
-  h->next = g.free_list;
-  h->prev = NULL;
-  if (g.free_list) g.free_list->prev = h;
-  g.free_list = h;
-}
-
-/*
- * quarantine_block - Remove corrupted block from circulation
- *
- * Safely removes a block from the free list (if present) and adds it
- * to the quarantine list. Since the block may be corrupted, we search
- * the free list by pointer rather than trusting is_free flag.
- */
-static void quarantine_block(Hdr *h) {
-  if (!h) return;
-
-  /* Search free list for this block (don't trust is_free - may be corrupted) */
-  Hdr *cur = g.free_list;
-  Hdr *prev_node = NULL;
-  int max_iter = 10000;  /* Prevent infinite loops from corrupted list */
-  while (cur && max_iter-- > 0) {
-    if (cur == h) {
-      /* Found in free list - remove it safely */
-      Hdr *next_ptr = cur->next;
-      if (!valid_ptr(next_ptr) && next_ptr != NULL) {
-        /* next pointer is corrupted - truncate list here */
-        next_ptr = NULL;
-      }
-      if (prev_node) {
-        prev_node->next = next_ptr;
-      } else {
-        g.free_list = next_ptr;
-      }
-      if (next_ptr && valid_ptr(next_ptr)) {
-        next_ptr->prev = prev_node;
-      }
-      break;
-    }
-    prev_node = cur;
-    /* Validate next pointer before following it */
-    Hdr *next = cur->next;
-    if (next && !valid_ptr(next)) {
-      /* Corrupted next pointer - stop traversal */
-      break;
-    }
-    cur = next;
-  }
-
-  /* Add to quarantine list */
-  h->next = g.quarantine;
-  h->prev = NULL;
-  g.quarantine = h;
-  g.quarantine_cnt++;
-  g.corrupt_count++;
-}
-
-/*
- * align_up - Round value up to alignment boundary
- */
-static size_t align_up(size_t v, size_t a) {
-  return ((v + a - 1) / a) * a;
-}
-
-/*
- * find_block - Find a suitable free block
- *
- * Uses first-fit strategy. Quarantines corrupted blocks.
- * Handles corrupted free list pointers safely.
- */
-static Hdr *find_block(size_t need) {
-  Hdr *cur = g.free_list;
-  int max_iter = 10000;  /* Prevent infinite loops */
-  while (cur && max_iter-- > 0) {
-    /* Save next pointer before potentially quarantining */
-    Hdr *next_block = cur->next;
-
-    /* Validate next pointer */
-    if (next_block && !valid_ptr(next_block)) {
-      /* Corrupted next pointer - truncate list and quarantine current */
-      cur->next = NULL;
-      next_block = NULL;
-    }
-
-    /* Check block validity */
-    if (!valid_block(cur)) {
-      quarantine_block(cur);
-      cur = next_block;
-      continue;
-    }
-
-    /* Check if block is suitable */
-    if (cur->is_free && cur->size >= need) {
-      return cur;
-    }
-    cur = next_block;
-  }
-  return NULL;
-}
-
-/*
- * do_split - Split a block if it's too large
- */
-static void do_split(Hdr *h, size_t need) {
-  size_t min_new = sizeof(Hdr) + MIN_PAYLOAD + sizeof(Ftr);
-  if (h->size < need + min_new) return;
-
-  size_t new_sz = h->size - need - sizeof(Hdr) - sizeof(Ftr);
-  uint8_t *loc = (uint8_t *)h + sizeof(Hdr) + need + sizeof(Ftr);
-  Hdr *new_h = (Hdr *)loc;
-
-  /* Initialize new block header with commit pending */
-  new_h->magic = MAGIC_HDR;
-  new_h->canary = CANARY;
-  new_h->size = new_sz;
-  new_h->size_backup = new_sz;
-  new_h->is_free = 1;
-  new_h->commit = COMMIT_PENDING;
-  new_h->next = new_h->prev = NULL;
-
-  /* Write footer with commit pending */
-  fin_ftr(get_footer(new_h), new_sz, COMMIT_PENDING);
-
-  /* Now finalize header */
-  fin_hdr(new_h);
-
-  /* Mark commit as complete */
-  new_h->commit = COMMIT_COMPLETE;
-  fin_hdr(new_h);
-  fin_ftr(get_footer(new_h), new_sz, COMMIT_COMPLETE);
-
-  /* Write free pattern */
-  write_pat(get_payload(new_h), payload_size(new_h));
-
-  /* Update original block */
-  h->size = need;
-  h->size_backup = need;
-  h->commit = COMMIT_COMPLETE;
-  fin_ftr(get_footer(h), need, COMMIT_COMPLETE);
-  fin_hdr(h);
-
-  list_add(new_h);
-}
-
-/*
- * do_coalesce - Merge adjacent free blocks
- */
-static void do_coalesce(void) {
-  uint8_t *scan = g.start;
-  while (scan + sizeof(Hdr) + sizeof(Ftr) <= g.end) {
-    Hdr *cur = (Hdr *)scan;
-
-    /* Check for valid header */
-    if (cur->magic != MAGIC_HDR) {
-      scan += 8;
-      continue;
-    }
-
-    /* Try to get valid size */
-    size_t sz = cur->size;
-    if (sz == 0 || sz > g.heap_size) {
-      sz = try_recover_size(cur);
-    }
-    if (sz == 0 || sz > g.heap_size) {
-      scan += 8;
-      continue;
-    }
-
-    /* Validate full block */
-    if (!valid_block(cur)) {
-      quarantine_block(cur);
-      scan += 8;
-      continue;
-    }
-
-    size_t total = sizeof(Hdr) + sz + sizeof(Ftr);
-    uint8_t *next_pos = scan + total;
-    if (next_pos + sizeof(Hdr) + sizeof(Ftr) > g.end) break;
-
-    Hdr *next = (Hdr *)next_pos;
-
-    /* Check if next block is valid */
-    if (next->magic != MAGIC_HDR) {
-      scan = next_pos;
-      continue;
-    }
-
-    size_t next_sz = next->size;
-    if (next_sz == 0 || next_sz > g.heap_size) {
-      next_sz = try_recover_size(next);
-    }
-    if (next_sz == 0 || next_sz > g.heap_size) {
-      scan = next_pos;
-      continue;
-    }
-
-    /* Check if both blocks are free and can be merged */
-    bool can_merge = valid_block(next) && cur->is_free && next->is_free;
-
-    if (can_merge) {
-      list_rm(next);
-      size_t combined = cur->size + sizeof(Hdr) + sizeof(Ftr) + next->size;
-
-      /* Update with brownout-safe sequence */
-      cur->size = combined;
-      cur->size_backup = combined;
-      cur->commit = COMMIT_COMPLETE;
-      fin_ftr(get_footer(cur), combined, COMMIT_COMPLETE);
-      fin_hdr(cur);
-
-      write_pat(get_payload(cur), payload_size(cur));
-      continue;
-    }
-    scan = next_pos;
-  }
-}
-
-/*
- * mm_init - Initialize the memory allocator
+ * Initialize the allocator with a memory block.
  */
 int mm_init(uint8_t *heap, size_t heap_size) {
-  if (!heap || heap_size < 1024) return -1;
+    if (!heap || heap_size < 512) {
+        return -1;
+    }
 
-  /* Initialize CRC table */
-  init_crc32_table();
+    /* Clear allocator state */
+    memset(&g_alloc, 0, sizeof(g_alloc));
+    g_alloc.heap_base = heap;
+    g_alloc.heap_limit = heap + heap_size;
+    g_alloc.heap_size = heap_size;
+    g_alloc.is_initialized = true;
 
-  memset(&g, 0, sizeof(g));
-  g.start = heap;
-  g.end = heap + heap_size;
-  g.heap_size = heap_size;
-  g.init = true;
+    /* Calculate usable space */
+    size_t overhead = sizeof(BlockHdr) + sizeof(BlockFtr);
+    size_t usable = heap_size - overhead;
+    usable = (usable / 8) * 8;  /* Align to 8 bytes */
 
-  /* Calculate usable size */
-  size_t overhead = sizeof(Hdr) + sizeof(Ftr);
-  size_t usable = heap_size - overhead;
-  usable = (usable / 8) * 8;
+    /* Initialize first block (mark as writing first for brownout protection) */
+    BlockHdr *h = (BlockHdr *)heap;
+    h->magic = HDR_MAGIC_WRITING;
+    h->canary = CANARY_VALUE;
+    h->data_size = usable;
+    h->data_size_backup = usable;
+    h->allocated = 0;
+    h->commit = COMMIT_PENDING;
+    h->padding = 0;
+    h->next_free = NULL;
+    h->prev_free = NULL;
 
-  Hdr *h = (Hdr *)heap;
+    /* Initialize footer */
+    init_ftr(hdr_to_ftr(h), usable);
 
-  /* Initialize header with commit pending (brownout-safe) */
-  h->magic = MAGIC_HDR;
-  h->canary = CANARY;
-  h->size = usable;
-  h->size_backup = usable;
-  h->is_free = 1;
-  h->commit = COMMIT_PENDING;
-  h->next = h->prev = NULL;
+    /* Mark header as complete */
+    h->commit = COMMIT_DONE;
+    h->magic = HDR_MAGIC_VALID;
+    finalize_hdr(h);
 
-  /* Write footer first */
-  fin_ftr(get_footer(h), usable, COMMIT_PENDING);
+    /* Fill with free pattern */
+    write_free_pattern(hdr_to_payload(h), get_payload_capacity(h));
 
-  /* Finalize header */
-  fin_hdr(h);
+    /* Set up free list */
+    g_alloc.free_list_head = h;
+    g_alloc.bytes_free = usable;
 
-  /* Mark as complete */
-  h->commit = COMMIT_COMPLETE;
-  fin_hdr(h);
-  fin_ftr(get_footer(h), usable, COMMIT_COMPLETE);
-
-  /* Write free pattern */
-  write_pat(get_payload(h), payload_size(h));
-
-  g.free_list = h;
-  g.free_bytes = usable;
-  return 0;
+    return 0;
 }
 
 /*
- * mm_malloc - Allocate memory
+ * Allocate memory.
  */
 void *mm_malloc(size_t size) {
-  if (!g.init || size == 0) return NULL;
+    if (!g_alloc.is_initialized || size == 0) {
+        return NULL;
+    }
 
-  size_t need = size + ALIGNMENT;
-  need = align_up(need, 8);
-  if (need < MIN_PAYLOAD) need = MIN_PAYLOAD;
-  if (need > g.heap_size) return NULL;
+    /* Calculate needed data size with alignment padding */
+    size_t needed = size + ALIGNMENT;  /* Extra space for alignment */
+    needed = round_up(needed, 8);
+    if (needed < MIN_BLOCK_DATA) needed = MIN_BLOCK_DATA;
+    if (needed > g_alloc.heap_size) return NULL;
 
-  Hdr *h = find_block(need);
-  if (!h) {
-    do_coalesce();
-    h = find_block(need);
-  }
-  if (!h) return NULL;
+    /* Find a free block */
+    BlockHdr *h = find_free_block(needed);
+    if (!h) {
+        coalesce_blocks();
+        h = find_free_block(needed);
+    }
+    if (!h) return NULL;
 
-  do_split(h, need);
-  list_rm(h);
+    /* Split if block is too large */
+    split_block(h, needed);
 
-  /* Update allocation status with brownout safety */
-  h->is_free = 0;
-  h->commit = COMMIT_COMPLETE;
-  fin_hdr(h);
-  fin_ftr(get_footer(h), h->size, COMMIT_COMPLETE);
+    /* Remove from free list */
+    remove_from_freelist(h);
 
-  g.alloc_bytes += h->size;
-  g.free_bytes -= h->size;
-  g.alloc_count++;
+    /* Mark as allocated (with brownout protection) */
+    h->magic = HDR_MAGIC_WRITING;
+    h->allocated = 1;
+    h->commit = COMMIT_DONE;
+    h->magic = HDR_MAGIC_VALID;
+    finalize_hdr(h);
+    init_ftr(hdr_to_ftr(h), h->data_size);
 
-  void *p = get_payload(h);
-  memset(p, 0, size);
-  return p;
+    /* Update statistics */
+    g_alloc.bytes_allocated += h->data_size;
+    g_alloc.bytes_free -= h->data_size;
+    g_alloc.total_allocs++;
+
+    /* Return aligned payload pointer, zeroed */
+    void *payload = hdr_to_payload(h);
+    memset(payload, 0, size);
+
+    return payload;
 }
 
 /*
- * mm_read - Safely read from an allocated block
- *
- * Returns bytes read, or -1 on error.
- * Handles len=0 by returning 0 (success with no data).
+ * Safely read from allocated memory.
+ * Validates block integrity before reading.
  */
 int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
-  if (!ptr || !buf) return -1;
-  if (len == 0) return 0;  /* Success - no data to read */
+    if (!ptr || !buf) return -1;
+    if (len == 0) return 0;
 
-  Hdr *h = ptr_to_hdr(ptr);
-  if (!h) return -1;
+    BlockHdr *h = payload_to_hdr(ptr);
+    if (!h) return -1;
 
-  /* Check block integrity */
-  if (!valid_block(h)) {
-    quarantine_block(h);
-    return -1;
-  }
+    /* Validate block integrity */
+    if (!validate_block(h)) {
+        g_alloc.corruption_detections++;
+        return -1;
+    }
 
-  if (h->is_free) return -1;
+    /* Must be allocated */
+    if (!h->allocated) return -1;
 
-  size_t ps = payload_size(h);
-  /* Return -1 for any out-of-bounds access */
-  if (offset >= ps || offset + len > ps) return -1;
+    /* Bounds check (safe from overflow) */
+    size_t capacity = get_payload_capacity(h);
+    if (offset >= capacity) return -1;
+    if (len > capacity - offset) return -1;
 
-  memcpy(buf, (uint8_t *)ptr + offset, len);
-  return (int)len;
+    memcpy(buf, (uint8_t *)ptr + offset, len);
+    return (int)len;
 }
 
 /*
- * mm_write - Safely write to an allocated block
- *
- * Returns bytes written, or -1 on error.
- * Handles len=0 by returning 0 (success with no data).
+ * Safely write to allocated memory.
+ * Validates block integrity before writing.
  */
 int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
-  if (!ptr || !src) return -1;
-  if (len == 0) return 0;  /* Success - no data to write */
+    if (!ptr || !src) return -1;
+    if (len == 0) return 0;
 
-  Hdr *h = ptr_to_hdr(ptr);
-  if (!h) return -1;
+    BlockHdr *h = payload_to_hdr(ptr);
+    if (!h) return -1;
 
-  /* Check block integrity */
-  if (!valid_block(h)) {
-    quarantine_block(h);
-    return -1;
-  }
+    /* Validate block integrity */
+    if (!validate_block(h)) {
+        g_alloc.corruption_detections++;
+        return -1;
+    }
 
-  if (h->is_free) return -1;
+    /* Must be allocated */
+    if (!h->allocated) return -1;
 
-  size_t ps = payload_size(h);
-  /* Return -1 for any out-of-bounds access */
-  if (offset >= ps || offset + len > ps) return -1;
+    /* Bounds check (safe from overflow) */
+    size_t capacity = get_payload_capacity(h);
+    if (offset >= capacity) return -1;
+    if (len > capacity - offset) return -1;
 
-  memcpy((uint8_t *)ptr + offset, src, len);
-  return (int)len;
+    memcpy((uint8_t *)ptr + offset, src, len);
+    return (int)len;
 }
 
 /*
- * mm_free - Free a previously allocated block
+ * Free allocated memory.
+ * Handles corruption and double-free safely.
  */
 void mm_free(void *ptr) {
-  if (!ptr) return;
+    if (!ptr) return;
 
-  Hdr *h = ptr_to_hdr(ptr);
-  if (!h) return;
+    BlockHdr *h = payload_to_hdr(ptr);
+    if (!h) return;
 
-  /* Check block integrity */
-  if (!valid_block(h)) {
-    quarantine_block(h);
-    return;
-  }
+    /* Check for corruption */
+    if (!validate_block(h)) {
+        g_alloc.corruption_detections++;
+        g_alloc.quarantine_count++;
+        return;  /* Don't touch corrupted block */
+    }
 
-  /* Detect double-free */
-  if (h->is_free) return;
+    /* Double-free detection */
+    if (!h->allocated) return;
 
-  /* Mark as free with brownout safety */
-  h->is_free = 1;
-  h->commit = COMMIT_COMPLETE;
-  fin_hdr(h);
-  fin_ftr(get_footer(h), h->size, COMMIT_COMPLETE);
+    /* Mark as free (with brownout protection) */
+    h->magic = HDR_MAGIC_WRITING;
+    h->allocated = 0;
+    h->commit = COMMIT_DONE;
+    h->magic = HDR_MAGIC_VALID;
+    finalize_hdr(h);
 
-  /* Write free pattern */
-  write_pat(get_payload(h), payload_size(h));
+    /* Fill payload with free pattern */
+    write_free_pattern(hdr_to_payload(h), get_payload_capacity(h));
 
-  list_add(h);
-  g.alloc_bytes -= h->size;
-  g.free_bytes += h->size;
+    /* Add to free list */
+    add_to_freelist(h);
+    finalize_hdr(h);  /* Update checksum after adding to list */
 
-  do_coalesce();
+    /* Update statistics */
+    g_alloc.bytes_allocated -= h->data_size;
+    g_alloc.bytes_free += h->data_size;
+
+    /* Try to coalesce */
+    coalesce_blocks();
 }
 
 /*
- * mm_realloc - Resize an allocated block
+ * Resize allocated memory.
+ * Preserves existing data up to min(old_size, new_size).
  */
 void *mm_realloc(void *ptr, size_t new_size) {
-  if (!ptr) return mm_malloc(new_size);
-  if (new_size == 0) {
+    if (!ptr) return mm_malloc(new_size);
+    if (new_size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+
+    BlockHdr *h = payload_to_hdr(ptr);
+    if (!h) return NULL;
+
+    if (!validate_block(h)) {
+        g_alloc.corruption_detections++;
+        return NULL;
+    }
+
+    size_t old_capacity = get_payload_capacity(h);
+
+    /* If current block is large enough, keep it */
+    if (new_size <= old_capacity) {
+        return ptr;
+    }
+
+    /* Allocate new block */
+    void *new_ptr = mm_malloc(new_size);
+    if (!new_ptr) return NULL;
+
+    /* Copy old data */
+    memcpy(new_ptr, ptr, old_capacity);
+
+    /* Free old block */
     mm_free(ptr);
-    return NULL;
-  }
 
-  Hdr *h = ptr_to_hdr(ptr);
-  if (!h) return NULL;
-
-  /* Check block integrity */
-  if (!valid_block(h)) {
-    quarantine_block(h);
-    return NULL;
-  }
-
-  size_t old_ps = payload_size(h);
-  if (new_size <= old_ps) return ptr;
-
-  void *new_ptr = mm_malloc(new_size);
-  if (!new_ptr) return NULL;
-
-  memcpy(new_ptr, ptr, old_ps);
-  mm_free(ptr);
-  return new_ptr;
+    return new_ptr;
 }
 
 /*
- * mm_heap_stats - Print heap statistics
+ * Print heap statistics for debugging.
  */
 void mm_heap_stats(void) {
-  printf("\n=== Heap Statistics ===\n");
-  printf("Heap Start: %p\n", (void *)g.start);
-  printf("Heap Size: %zu bytes\n", g.heap_size);
-  printf("Total Allocated: %zu bytes\n", g.alloc_bytes);
-  printf("Total Free: %zu bytes\n", g.free_bytes);
-  printf("Total Allocations: %zu\n", g.alloc_count);
-  printf("Corruption Detections: %zu\n", g.corrupt_count);
-  printf("Quarantined Blocks: %zu\n", g.quarantine_cnt);
+    printf("\n=== Heap Statistics ===\n");
+    printf("Heap Start: %p\n", (void *)g_alloc.heap_base);
+    printf("Heap Size: %zu bytes\n", g_alloc.heap_size);
+    printf("Total Allocated: %zu bytes\n", g_alloc.bytes_allocated);
+    printf("Total Free: %zu bytes\n", g_alloc.bytes_free);
+    printf("Total Allocations: %zu\n", g_alloc.total_allocs);
+    printf("Corruption Detections: %zu\n", g_alloc.corruption_detections);
+    printf("Quarantined Blocks: %zu\n", g_alloc.quarantine_count);
 
-  size_t free_count = 0, free_size = 0, max_free = 0;
-  Hdr *cur = g.free_list;
-  while (cur) {
-    free_count++;
-    free_size += cur->size;
-    if (cur->size > max_free) max_free = cur->size;
-    cur = cur->next;
-  }
-  printf("Free Blocks: %zu\n", free_count);
-  printf("Free List Size: %zu bytes\n", free_size);
-  printf("Largest Free Block: %zu bytes\n", max_free);
-  printf("======================\n");
+    /* Count free list */
+    size_t free_count = 0;
+    size_t free_total = 0;
+    size_t max_free = 0;
+    BlockHdr *cur = g_alloc.free_list_head;
+    size_t max_iter = 10000;
+
+    while (cur && ptr_in_heap(cur) && free_count < max_iter) {
+        free_count++;
+        free_total += cur->data_size;
+        if (cur->data_size > max_free) max_free = cur->data_size;
+        cur = cur->next_free;
+    }
+
+    printf("Free Blocks: %zu\n", free_count);
+    printf("Free List Size: %zu bytes\n", free_total);
+    printf("Largest Free Block: %zu bytes\n", max_free);
+    printf("======================\n");
 }
