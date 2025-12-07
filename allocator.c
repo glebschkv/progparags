@@ -1,9 +1,9 @@
 /*
  * COMP2221 Systems Programming - Mars Rover Memory Allocator
  *
- * A fault-tolerant memory allocator that detects:
- * - Radiation storms (bit flips) via checksums
- * - Brownout events (partial writes) via header/footer consistency
+ * Fault-tolerant allocator detecting:
+ * - Radiation storms (bit flips) via checksums and redundant storage
+ * - Brownout events (partial writes) via pattern detection and metadata consistency
  */
 
 #include <stdbool.h>
@@ -13,37 +13,39 @@
 #include "allocator.h"
 
 #define ALIGNMENT 40
-#define MIN_BLOCK_SIZE 40
+#define MIN_BLOCK_SIZE 48
 
 /* Magic numbers */
 #define HDR_MAGIC 0xDEADBEEFU
 #define FTR_MAGIC 0xCAFEBABEU
 
+/* Required 5-byte free pattern */
+static const uint8_t FREE_PATTERN[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x99};
+
 /*
  * Block Header (32 bytes on 64-bit)
- * Pointers stored in data area, not header, so checksum doesn't change on list ops
  */
 typedef struct {
-    uint32_t magic;         /* HDR_MAGIC */
-    uint32_t checksum;      /* XOR of magic, size copies, allocated */
-    size_t size;            /* Total block size (header + data + footer) */
-    size_t size_copy;       /* Redundant copy for corruption detection */
-    uint32_t allocated;     /* 1 = allocated, 0 = free */
-    uint32_t reserved;      /* Padding */
+    uint32_t magic;           /* HDR_MAGIC */
+    uint32_t checksum;        /* XOR checksum */
+    size_t size;              /* Total block size */
+    size_t size_copy;         /* Redundant copy */
+    uint32_t allocated;       /* 1 = allocated, 0 = free */
+    uint32_t reserved;        /* Padding */
 } Header;
 
 /*
  * Block Footer (24 bytes on 64-bit)
  */
 typedef struct {
-    uint32_t magic;         /* FTR_MAGIC */
-    uint32_t checksum;      /* XOR of magic, size copies */
-    size_t size;            /* Must match header */
-    size_t size_copy;       /* Redundant copy */
+    uint32_t magic;
+    uint32_t checksum;
+    size_t size;
+    size_t size_copy;
 } Footer;
 
 /*
- * Free block links - stored at start of data area (not in header)
+ * Free list links - stored in payload area
  */
 typedef struct FreeLinks {
     struct FreeLinks *next;
@@ -94,12 +96,12 @@ static Footer *get_footer(Header *h) {
     return (Footer *)((uint8_t *)h + h->size - sizeof(Footer));
 }
 
-/* Get data area from header */
+/* Get data area */
 static uint8_t *get_data(Header *h) {
     return (uint8_t *)h + sizeof(Header);
 }
 
-/* Get aligned payload pointer */
+/* Get aligned payload - relative to ORIGINAL heap pointer */
 static void *get_payload(Header *h) {
     uint8_t *data = get_data(h);
     size_t offset = (size_t)(data - heap_start);
@@ -107,12 +109,20 @@ static void *get_payload(Header *h) {
     return data + padding;
 }
 
-/* Get payload capacity (usable bytes) */
+/* Get payload capacity */
 static size_t get_capacity(Header *h) {
     uint8_t *payload = (uint8_t *)get_payload(h);
     uint8_t *data_end = (uint8_t *)get_footer(h);
     if (payload >= data_end) return 0;
     return (size_t)(data_end - payload);
+}
+
+/* Fill memory with the 5-byte free pattern */
+static void fill_pattern(void *ptr, size_t len) {
+    uint8_t *p = (uint8_t *)ptr;
+    for (size_t i = 0; i < len; i++) {
+        p[i] = FREE_PATTERN[i % 5];
+    }
 }
 
 /* Validate header */
@@ -122,7 +132,7 @@ static bool valid_header(Header *h) {
     if (h->magic != HDR_MAGIC) return false;
     if (h->size < sizeof(Header) + sizeof(Footer)) return false;
     if (h->size > heap_size) return false;
-    if (h->size != h->size_copy) return false;  /* Corruption or brownout */
+    if (h->size != h->size_copy) return false;
     if ((uint8_t *)h + h->size > heap_end) return false;
     if (h->checksum != hdr_checksum(h)) return false;
     return true;
@@ -134,7 +144,7 @@ static bool valid_footer(Header *h) {
     if (!in_heap(f)) return false;
     if ((uint8_t *)f + sizeof(Footer) > heap_end) return false;
     if (f->magic != FTR_MAGIC) return false;
-    if (f->size != h->size) return false;  /* Header/footer mismatch = corruption or brownout */
+    if (f->size != h->size) return false;
     if (f->size != f->size_copy) return false;
     if (f->checksum != ftr_checksum(f)) return false;
     return true;
@@ -164,7 +174,7 @@ static void init_footer(Header *h) {
     f->checksum = ftr_checksum(f);
 }
 
-/* Get free links from block */
+/* Get free links */
 static FreeLinks *get_links(Header *h) {
     return (FreeLinks *)get_data(h);
 }
@@ -182,7 +192,7 @@ static void list_remove(Header *h) {
     }
 }
 
-/* Add to front of free list */
+/* Add to free list */
 static void list_add(Header *h) {
     FreeLinks *links = get_links(h);
     links->next = free_list;
@@ -198,27 +208,22 @@ static Header *find_header(void *payload) {
     if (!payload || !initialized) return NULL;
     if (!in_heap(payload)) return NULL;
 
-    /* Scan blocks to find matching payload */
     uint8_t *scan = heap_start;
     while (scan + sizeof(Header) + sizeof(Footer) <= heap_end) {
         Header *h = (Header *)scan;
 
         if (h->magic == HDR_MAGIC &&
             h->size >= sizeof(Header) + sizeof(Footer) &&
-            h->size <= heap_size) {
+            h->size <= heap_size &&
+            scan + h->size <= heap_end) {
 
             if (get_payload(h) == payload) {
                 return h;
             }
-
-            /* Move to next block */
-            if (scan + h->size <= heap_end) {
-                scan += h->size;
-                continue;
-            }
+            scan += h->size;
+        } else {
+            scan += 8;
         }
-        /* Corrupted - try next alignment */
-        scan += 8;
     }
     return NULL;
 }
@@ -240,30 +245,39 @@ int mm_init(uint8_t *heap, size_t size) {
     stat_allocated = 0;
     stat_corruptions = 0;
 
+    /* Fill entire heap with the 5-byte pattern first */
+    fill_pattern(heap, size);
+
     /* Create initial free block */
     Header *h = (Header *)heap;
-    size_t block_size = (size / 8) * 8;  /* Align to 8 */
+    size_t block_size = (size / 8) * 8;
 
     init_header(h, block_size, 0);
     init_footer(h);
 
-    /* Set up free links */
+    /* Set up free links first */
     FreeLinks *links = get_links(h);
     links->next = NULL;
     links->prev = NULL;
     free_list = links;
 
+    /* Fill data area with pattern (skip FreeLinks at start) */
+    uint8_t *data = get_data(h);
+    size_t data_len = block_size - sizeof(Header) - sizeof(Footer);
+    if (data_len > sizeof(FreeLinks)) {
+        fill_pattern(data + sizeof(FreeLinks), data_len - sizeof(FreeLinks));
+    }
+
     return 0;
 }
 
-/* Find free block of at least min_size bytes */
+/* Find free block */
 static Header *find_fit(size_t min_size) {
     FreeLinks *cur = free_list;
     FreeLinks *prev_link = NULL;
 
     while (cur) {
         if (!in_heap(cur)) {
-            /* Corrupted pointer - truncate list */
             if (prev_link) prev_link->next = NULL;
             else free_list = NULL;
             stat_corruptions++;
@@ -273,7 +287,6 @@ static Header *find_fit(size_t min_size) {
         Header *h = (Header *)((uint8_t *)cur - sizeof(Header));
 
         if (!valid_block(h)) {
-            /* Corrupted block - remove from list */
             stat_corruptions++;
             FreeLinks *next = cur->next;
             if (prev_link) prev_link->next = next;
@@ -293,9 +306,9 @@ static Header *find_fit(size_t min_size) {
     return NULL;
 }
 
-/* Split block if remainder is large enough */
+/* Split block */
 static void split_block(Header *h, size_t needed) {
-    size_t min_remainder = sizeof(Header) + ALIGNMENT + sizeof(FreeLinks) + sizeof(Footer);
+    size_t min_remainder = sizeof(Header) + MIN_BLOCK_SIZE + sizeof(Footer);
 
     if (h->size < needed + min_remainder) {
         return;
@@ -303,7 +316,7 @@ static void split_block(Header *h, size_t needed) {
 
     size_t new_size = h->size - needed;
 
-    /* Shrink original block */
+    /* Shrink original */
     init_header(h, needed, h->allocated);
     init_footer(h);
 
@@ -312,7 +325,13 @@ static void split_block(Header *h, size_t needed) {
     init_header(new_h, new_size, 0);
     init_footer(new_h);
 
-    /* Add new block to free list */
+    /* Fill data area with pattern (skip FreeLinks at start) */
+    uint8_t *data = get_data(new_h);
+    size_t data_len = new_size - sizeof(Header) - sizeof(Footer);
+    if (data_len > sizeof(FreeLinks)) {
+        fill_pattern(data + sizeof(FreeLinks), data_len - sizeof(FreeLinks));
+    }
+
     list_add(new_h);
 }
 
@@ -346,14 +365,26 @@ static void coalesce(void) {
             continue;
         }
 
-        /* Merge if both free */
         if (!h->allocated && !next_h->allocated) {
+            /* Remove both from free list before merging */
+            list_remove(h);
             list_remove(next_h);
 
             size_t combined = h->size + next_h->size;
             init_header(h, combined, 0);
             init_footer(h);
-            /* Don't advance - try to merge more */
+
+            /* Fill payload with pattern (after free list pointers) */
+            uint8_t *data = get_data(h);
+            size_t data_len = h->size - sizeof(Header) - sizeof(Footer);
+            /* Skip the FreeLinks area at start of data */
+            if (data_len > sizeof(FreeLinks)) {
+                fill_pattern(data + sizeof(FreeLinks), data_len - sizeof(FreeLinks));
+            }
+
+            /* Re-add to free list */
+            list_add(h);
+
             continue;
         }
 
@@ -365,8 +396,7 @@ static void coalesce(void) {
 void *mm_malloc(size_t size) {
     if (!initialized || size == 0) return NULL;
 
-    /* Calculate required block size */
-    size_t data_needed = size + ALIGNMENT;  /* Extra for alignment */
+    size_t data_needed = size + ALIGNMENT;
     size_t block_size = sizeof(Header) + data_needed + sizeof(Footer);
     block_size = align_up(block_size, 8);
 
@@ -374,7 +404,6 @@ void *mm_malloc(size_t size) {
         block_size = sizeof(Header) + MIN_BLOCK_SIZE + sizeof(Footer);
     }
 
-    /* Find fit */
     Header *h = find_fit(block_size);
     if (!h) {
         coalesce();
@@ -382,25 +411,22 @@ void *mm_malloc(size_t size) {
     }
     if (!h) return NULL;
 
-    /* Remove from free list */
     list_remove(h);
-
-    /* Split if too large */
     split_block(h, block_size);
 
-    /* Mark as allocated */
+    /* Mark as allocated with pending write */
     init_header(h, h->size, 1);
     init_footer(h);
 
     stat_allocated += h->size;
 
     void *payload = get_payload(h);
-    memset(payload, 0, size);
+    /* Payload still has the free pattern - will be overwritten by mm_write */
 
     return payload;
 }
 
-/* Read from allocated block */
+/* Read from block */
 int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
     if (!ptr || !buf) return -1;
     if (len == 0) return 0;
@@ -424,7 +450,7 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
     return (int)len;
 }
 
-/* Write to allocated block */
+/* Write to block */
 int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     if (!ptr || !src) return -1;
     if (len == 0) return 0;
@@ -448,7 +474,7 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     return (int)len;
 }
 
-/* Free allocated block */
+/* Free block */
 void mm_free(void *ptr) {
     if (!ptr) return;
 
@@ -460,7 +486,6 @@ void mm_free(void *ptr) {
         return;
     }
 
-    /* Double-free check */
     if (!h->allocated) return;
 
     stat_allocated -= h->size;
@@ -469,10 +494,16 @@ void mm_free(void *ptr) {
     init_header(h, h->size, 0);
     init_footer(h);
 
-    /* Add to free list */
+    /* Add to free list first (so FreeLinks are set) */
     list_add(h);
 
-    /* Coalesce */
+    /* Reset data area to free pattern (skip FreeLinks at start) */
+    uint8_t *data = get_data(h);
+    size_t data_len = h->size - sizeof(Header) - sizeof(Footer);
+    if (data_len > sizeof(FreeLinks)) {
+        fill_pattern(data + sizeof(FreeLinks), data_len - sizeof(FreeLinks));
+    }
+
     coalesce();
 }
 
@@ -498,9 +529,11 @@ void *mm_realloc(void *ptr, size_t new_size) {
     void *new_ptr = mm_malloc(new_size);
     if (!new_ptr) return NULL;
 
-    memcpy(new_ptr, ptr, old_cap);
-    mm_free(ptr);
+    /* Copy old data */
+    size_t copy_size = (old_cap < new_size) ? old_cap : new_size;
+    memcpy(new_ptr, ptr, copy_size);
 
+    mm_free(ptr);
     return new_ptr;
 }
 
@@ -509,7 +542,7 @@ void mm_heap_stats(void) {
     printf("\n=== Heap Statistics ===\n");
     printf("Heap: %p - %p (%zu bytes)\n", (void *)heap_start, (void *)heap_end, heap_size);
     printf("Allocated: %zu bytes\n", stat_allocated);
-    printf("Corruptions detected: %zu\n", stat_corruptions);
+    printf("Corruptions: %zu\n", stat_corruptions);
 
     size_t free_count = 0, free_bytes = 0;
     FreeLinks *cur = free_list;
