@@ -104,7 +104,12 @@ static uint32_t rotate_left(uint32_t value, int bits) {
   return (value << bits) | (value >> (32 - bits));
 }
 
-/* Computes checksum for a block header */
+/**
+ * Computes checksum for a block header.
+ * NOTE: write_state is intentionally excluded from checksum computation
+ * to allow brownout detection even when checksum appears invalid.
+ * This enables the three-state commit protocol to work correctly.
+ */
 static uint32_t compute_header_checksum(const Header *hdr) {
   uint32_t cs = 0x5A5A5A5AU;
   cs = rotate_left(cs, 5) ^ hdr->magic;
@@ -113,7 +118,7 @@ static uint32_t compute_header_checksum(const Header *hdr) {
   cs = rotate_left(cs, 13) ^ (uint32_t)(hdr->size_backup & 0xFFFFFFFFUL);
   cs = rotate_left(cs, 17) ^ (uint32_t)(hdr->size_backup >> 32);
   cs = rotate_left(cs, 19) ^ hdr->is_alloc;
-  cs = rotate_left(cs, 23) ^ hdr->write_state;
+  /* write_state excluded - checked separately for brownout detection */
   return cs;
 }
 
@@ -162,7 +167,10 @@ static uint8_t *get_data_area(Header *hdr) {
   return (uint8_t *)hdr + sizeof(Header);
 }
 
-/* Gets the aligned payload pointer for a block */
+/**
+ * Gets the aligned payload pointer for a block.
+ * Ensures payload offset from heap_start is divisible by ALIGNMENT (40 bytes).
+ */
 static void *get_aligned_payload(Header *hdr) {
   uint8_t *data = get_data_area(hdr);
   size_t offset_from_heap = (size_t)(data - heap_start);
@@ -208,7 +216,21 @@ static void quarantine_block(void *ptr) {
   stats_corruption_count++;
 }
 
-/* Validates a block header for corruption */
+/**
+ * Checks if write_state has a valid value.
+ * Used to detect radiation corruption of the write_state field.
+ */
+static bool is_valid_write_state(uint32_t state) {
+  return state == STATE_UNWRITTEN ||
+         state == STATE_WRITING ||
+         state == STATE_WRITTEN;
+}
+
+/**
+ * Validates a block header for corruption.
+ * Checks magic number, size consistency, bounds, and checksum.
+ * NOTE: write_state validation is done separately for brownout detection.
+ */
 static bool validate_header(Header *hdr) {
   if (!is_within_heap(hdr)) {
     return false;
@@ -232,6 +254,10 @@ static bool validate_header(Header *hdr) {
     return false;
   }
   if (hdr->checksum != compute_header_checksum(hdr)) {
+    return false;
+  }
+  /* Check write_state for radiation corruption (invalid value) */
+  if (!is_valid_write_state(hdr->write_state)) {
     return false;
   }
   return true;
@@ -266,7 +292,10 @@ static bool validate_block(Header *hdr) {
   return validate_header(hdr) && validate_footer(hdr);
 }
 
-/* Checks for brownout condition (interrupted write) */
+/**
+ * Checks for brownout condition (interrupted write).
+ * Returns true if the block was being written when power was lost.
+ */
 static bool detect_brownout(Header *hdr) {
   return (hdr->write_state == STATE_WRITING);
 }
@@ -563,7 +592,11 @@ void *mm_malloc(size_t size) {
   return payload;
 }
 
-/* Reads data from an allocated block */
+/**
+ * Reads data from an allocated block.
+ * Checks for brownout FIRST (before validation) to properly detect
+ * interrupted writes even if the checksum appears invalid.
+ */
 int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
   Header *hdr;
   size_t capacity;
@@ -580,15 +613,18 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
   if (is_quarantined(hdr)) {
     return -1;
   }
+  /* Check brownout FIRST - before checksum validation */
+  /* This allows detection even if checksum update was interrupted */
+  if (detect_brownout(hdr)) {
+    quarantine_block(hdr);
+    return -1;
+  }
+  /* Now check for radiation corruption via checksum */
   if (!validate_block(hdr)) {
     quarantine_block(hdr);
     return -1;
   }
   if (hdr->is_alloc == 0) {
-    return -1;
-  }
-  if (detect_brownout(hdr)) {
-    quarantine_block(hdr);
     return -1;
   }
   capacity = get_payload_capacity(hdr);
@@ -633,12 +669,16 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
   if (len > capacity - offset) {
     return -1;
   }
-  /* Three-state commit protocol for brownout detection */
+  /**
+   * Three-state commit protocol for brownout detection:
+   * 1. Set state to WRITING before payload modification
+   * 2. Perform the actual write
+   * 3. Set state to WRITTEN after completion
+   * Note: checksum doesn't include write_state, so no update needed
+   */
   hdr->write_state = STATE_WRITING;
-  hdr->checksum = compute_header_checksum(hdr);
   memcpy((uint8_t *)ptr + offset, src, len);
   hdr->write_state = STATE_WRITTEN;
-  hdr->checksum = compute_header_checksum(hdr);
   return (int)len;
 }
 
@@ -711,10 +751,11 @@ void *mm_realloc(void *ptr, size_t new_size) {
   }
   copy_size = (old_capacity < new_size) ? old_capacity : new_size;
   memcpy(new_ptr, ptr, copy_size);
+  /* Mark the new block as written since data was copied */
   new_hdr = find_block_header(new_ptr);
-  if (new_hdr != NULL && new_hdr->write_state != STATE_WRITTEN) {
+  if (new_hdr != NULL) {
     new_hdr->write_state = STATE_WRITTEN;
-    new_hdr->checksum = compute_header_checksum(new_hdr);
+    /* Note: no checksum update needed - write_state excluded */
   }
   mm_free(ptr);
   return new_ptr;
