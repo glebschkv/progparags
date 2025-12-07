@@ -148,12 +148,13 @@ static size_t align_up(size_t value, size_t alignment) {
   return ((value + alignment - 1) / alignment) * alignment;
 }
 
-/* Fills a memory region with the 5-byte free pattern */
+/* Fills a memory region with the 5-byte free pattern based on heap offset */
 static void fill_free_pattern(void *ptr, size_t len) {
   uint8_t *p = (uint8_t *)ptr;
+  size_t base_offset = (size_t)(p - heap_start);
   size_t i;
   for (i = 0; i < len; i++) {
-    p[i] = FREE_PATTERN[i % 5];
+    p[i] = FREE_PATTERN[(base_offset + i) % 5];
   }
 }
 
