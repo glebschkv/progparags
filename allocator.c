@@ -381,12 +381,14 @@ static Header *find_free_block(size_t min_size) {
     Header *hdr;
     FreeLinks *next;
     if (!is_within_heap(current)) {
+      /* Free list pointer is corrupted - truncate list and stop */
       if (prev_link != NULL) {
         prev_link->next = NULL;
       } else {
         free_list_head = NULL;
       }
-      quarantine_block(current);
+      /* Don't quarantine - current is not a valid block header */
+      stats_corruption_count++;
       break;
     }
     hdr = (Header *)((uint8_t *)current - sizeof(Header));
@@ -779,12 +781,14 @@ void *mm_realloc(void *ptr, size_t new_size) {
     return NULL;
   }
   copy_size = (old_capacity < new_size) ? old_capacity : new_size;
-  memcpy(new_ptr, ptr, copy_size);
-  /* Mark the new block as written since data was copied */
+  /* Use three-state protocol for the copy to detect brownout */
   new_hdr = find_block_header(new_ptr);
   if (new_hdr != NULL) {
+    new_hdr->write_state = STATE_WRITING;
+  }
+  memcpy(new_ptr, ptr, copy_size);
+  if (new_hdr != NULL) {
     new_hdr->write_state = STATE_WRITTEN;
-    /* Note: no checksum update needed - write_state excluded */
   }
   mm_free(ptr);
   return new_ptr;
