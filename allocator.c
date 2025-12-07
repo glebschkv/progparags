@@ -31,8 +31,11 @@ typedef struct {
     size_t size;              /* Total block size */
     size_t size_copy;         /* Redundant copy */
     uint32_t allocated;       /* 1 = allocated, 0 = free */
-    uint32_t reserved;        /* Padding */
+    uint32_t written;         /* 1 = data written, 0 = not yet written (brownout detection) */
 } Header;
+
+#define WRITTEN_NO  0
+#define WRITTEN_YES 1
 
 /*
  * Block Footer (24 bytes on 64-bit)
@@ -72,6 +75,7 @@ static uint32_t hdr_checksum(Header *h) {
     cs ^= (uint32_t)(h->size_copy & 0xFFFFFFFFUL);
     cs ^= (uint32_t)(h->size_copy >> 32);
     cs ^= h->allocated;
+    cs ^= h->written;
     return cs;
 }
 
@@ -156,12 +160,12 @@ static bool valid_block(Header *h) {
 }
 
 /* Initialize header */
-static void init_header(Header *h, size_t block_size, uint32_t alloc) {
+static void init_header(Header *h, size_t block_size, uint32_t alloc, uint32_t written) {
     h->magic = HDR_MAGIC;
     h->size = block_size;
     h->size_copy = block_size;
     h->allocated = alloc;
-    h->reserved = 0;
+    h->written = written;
     h->checksum = hdr_checksum(h);
 }
 
@@ -252,7 +256,7 @@ int mm_init(uint8_t *heap, size_t size) {
     Header *h = (Header *)heap;
     size_t block_size = (size / 8) * 8;
 
-    init_header(h, block_size, 0);
+    init_header(h, block_size, 0, WRITTEN_YES);
     init_footer(h);
 
     /* Set up free links first */
@@ -317,12 +321,12 @@ static void split_block(Header *h, size_t needed) {
     size_t new_size = h->size - needed;
 
     /* Shrink original */
-    init_header(h, needed, h->allocated);
+    init_header(h, needed, h->allocated, h->written);
     init_footer(h);
 
     /* Create new free block */
     Header *new_h = (Header *)((uint8_t *)h + needed);
-    init_header(new_h, new_size, 0);
+    init_header(new_h, new_size, 0, WRITTEN_YES);
     init_footer(new_h);
 
     /* Fill data area with pattern (skip FreeLinks at start) */
@@ -371,7 +375,7 @@ static void coalesce(void) {
             list_remove(next_h);
 
             size_t combined = h->size + next_h->size;
-            init_header(h, combined, 0);
+            init_header(h, combined, 0, WRITTEN_YES);
             init_footer(h);
 
             /* Fill payload with pattern (after free list pointers) */
@@ -414,8 +418,8 @@ void *mm_malloc(size_t size) {
     list_remove(h);
     split_block(h, block_size);
 
-    /* Mark as allocated with pending write */
-    init_header(h, h->size, 1);
+    /* Mark as allocated with pending write (brownout detection) */
+    init_header(h, h->size, 1, WRITTEN_NO);
     init_footer(h);
 
     stat_allocated += h->size;
@@ -440,6 +444,12 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
     }
 
     if (!h->allocated) return -1;
+
+    /* Brownout detection: check if data was written */
+    if (h->written != WRITTEN_YES) {
+        stat_corruptions++;
+        return -1;
+    }
 
     size_t cap = get_capacity(h);
     if (offset >= cap || len > cap - offset) {
@@ -471,6 +481,13 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     }
 
     memcpy((uint8_t *)ptr + offset, src, len);
+
+    /* Mark block as written (for brownout detection) */
+    if (h->written != WRITTEN_YES) {
+        h->written = WRITTEN_YES;
+        h->checksum = hdr_checksum(h);
+    }
+
     return (int)len;
 }
 
@@ -491,7 +508,7 @@ void mm_free(void *ptr) {
     stat_allocated -= h->size;
 
     /* Mark as free */
-    init_header(h, h->size, 0);
+    init_header(h, h->size, 0, WRITTEN_YES);
     init_footer(h);
 
     /* Add to free list first (so FreeLinks are set) */
@@ -532,6 +549,13 @@ void *mm_realloc(void *ptr, size_t new_size) {
     /* Copy old data */
     size_t copy_size = (old_cap < new_size) ? old_cap : new_size;
     memcpy(new_ptr, ptr, copy_size);
+
+    /* Mark new block as written */
+    Header *new_h = find_header(new_ptr);
+    if (new_h && new_h->written != WRITTEN_YES) {
+        new_h->written = WRITTEN_YES;
+        new_h->checksum = hdr_checksum(new_h);
+    }
 
     mm_free(ptr);
     return new_ptr;
