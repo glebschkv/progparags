@@ -483,7 +483,7 @@ static void coalesce_free_blocks(void) {
   size_t min_block_size;
   scan = heap_start;
   min_block_size = sizeof(Header) + sizeof(Footer);
-  while (scan + min_block_size < heap_end) {
+  while (scan + min_block_size <= heap_end) {
     Header *hdr = (Header *)scan;
     Header *next_hdr;
     uint8_t *next_addr;
@@ -582,9 +582,6 @@ void *mm_malloc(size_t size) {
   size_t min_block_size;
   Header *hdr;
   void *payload;
-  size_t capacity;
-  size_t base_offset;
-  size_t i;
   if (!is_initialized) {
     return NULL;
   }
@@ -607,12 +604,13 @@ void *mm_malloc(size_t size) {
   init_header(hdr, hdr->size, 1, STATE_UNWRITTEN);
   init_footer(hdr);
   stats_allocated_bytes += hdr->size;
-  payload = get_aligned_payload(hdr);
-  capacity = get_payload_capacity(hdr);
-  base_offset = (size_t)((uint8_t *)payload - heap_start);
-  for (i = 0; i < capacity; i++) {
-    ((uint8_t *)payload)[i] = FREE_PATTERN[(base_offset + i) % 5];
+  /* Fill ENTIRE data area with FREE_PATTERN (including padding before payload) */
+  {
+    uint8_t *data = get_data_area(hdr);
+    size_t data_len = hdr->size - sizeof(Header) - sizeof(Footer);
+    fill_free_pattern(data, data_len);
   }
+  payload = get_aligned_payload(hdr);
   return payload;
 }
 
