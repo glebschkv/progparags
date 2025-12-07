@@ -427,7 +427,13 @@ void *mm_malloc(size_t size) {
     stat_allocated += h->size;
 
     void *payload = get_payload(h);
-    /* Payload still has the free pattern - will be overwritten by mm_write */
+
+    /* Fill payload with free pattern to ensure clean state for brownout detection */
+    size_t cap = get_capacity(h);
+    size_t base_offset = (size_t)((uint8_t *)payload - heap_start);
+    for (size_t i = 0; i < cap; i++) {
+        ((uint8_t *)payload)[i] = FREE_PATTERN[(base_offset + i) % 5];
+    }
 
     return payload;
 }
@@ -453,7 +459,6 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
         stat_corruptions++;
         return -1;
     }
-    /* WRITE_STATE_UNWRITTEN and WRITE_STATE_WRITTEN are both OK to read */
 
     size_t cap = get_capacity(h);
     if (offset >= cap || len > cap - offset) {
