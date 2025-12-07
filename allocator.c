@@ -188,6 +188,24 @@ static size_t get_payload_capacity(Header *hdr) {
   return (size_t)(footer_start - payload);
 }
 
+/**
+ * Calculates the minimum block size needed for a given payload size
+ * at a specific block position. Takes into account the actual alignment
+ * padding required at this position.
+ */
+static size_t get_min_block_size_for_payload(Header *hdr, size_t payload_size) {
+  uint8_t *data = get_data_area(hdr);
+  size_t offset_from_heap = (size_t)(data - heap_start);
+  size_t padding = (ALIGNMENT - (offset_from_heap % ALIGNMENT)) % ALIGNMENT;
+  size_t min_size = sizeof(Header) + padding + payload_size + sizeof(Footer);
+  size_t min_block = sizeof(Header) + MIN_DATA_SIZE + sizeof(Footer);
+  min_size = align_up(min_size, 8);
+  if (min_size < min_block) {
+    min_size = min_block;
+  }
+  return min_size;
+}
+
 /* Gets the free list links from a free block */
 static FreeLinks *get_free_links(Header *hdr) {
   return (FreeLinks *)get_data_area(hdr);
@@ -373,8 +391,12 @@ static Header *find_block_header(void *payload) {
   return NULL;
 }
 
-/* Finds a free block of at least the specified size */
-static Header *find_free_block(size_t min_size) {
+/**
+ * Finds a free block with sufficient payload capacity.
+ * Checks the ACTUAL payload capacity based on alignment at each block's
+ * position, not an over-estimated block size.
+ */
+static Header *find_free_block(size_t payload_size) {
   FreeLinks *current = free_list_head;
   FreeLinks *prev_link = NULL;
   while (current != NULL) {
@@ -419,7 +441,8 @@ static Header *find_free_block(size_t min_size) {
       current = next;
       continue;
     }
-    if (hdr->is_alloc == 0 && hdr->size >= min_size) {
+    /* Check ACTUAL payload capacity at this position, not block size */
+    if (hdr->is_alloc == 0 && get_payload_capacity(hdr) >= payload_size) {
       return hdr;
     }
     prev_link = current;
@@ -549,11 +572,13 @@ int mm_init(uint8_t *heap, size_t heap_size) {
   return 0;
 }
 
-/* Allocates a block of memory */
+/**
+ * Allocates a block of memory.
+ * Searches for a block with sufficient ACTUAL payload capacity, then
+ * calculates the minimum block size needed for this specific position.
+ */
 void *mm_malloc(size_t size) {
-  size_t data_needed;
-  size_t block_size;
-  size_t min_block;
+  size_t min_block_size;
   Header *hdr;
   void *payload;
   size_t capacity;
@@ -565,23 +590,19 @@ void *mm_malloc(size_t size) {
   if (size == 0) {
     return NULL;
   }
-  data_needed = size + ALIGNMENT;
-  block_size = sizeof(Header) + data_needed + sizeof(Footer);
-  block_size = align_up(block_size, 8);
-  min_block = sizeof(Header) + MIN_DATA_SIZE + sizeof(Footer);
-  if (block_size < min_block) {
-    block_size = min_block;
-  }
-  hdr = find_free_block(block_size);
+  /* Find a block with sufficient ACTUAL payload capacity */
+  hdr = find_free_block(size);
   if (hdr == NULL) {
     coalesce_free_blocks();
-    hdr = find_free_block(block_size);
+    hdr = find_free_block(size);
   }
   if (hdr == NULL) {
     return NULL;
   }
   free_list_remove(hdr);
-  split_block(hdr, block_size);
+  /* Calculate minimum block size based on THIS block's alignment padding */
+  min_block_size = get_min_block_size_for_payload(hdr, size);
+  split_block(hdr, min_block_size);
   init_header(hdr, hdr->size, 1, STATE_UNWRITTEN);
   init_footer(hdr);
   stats_allocated_bytes += hdr->size;
