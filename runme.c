@@ -368,6 +368,100 @@ static void run_ops_test(int num_ops, unsigned int *seedp) {
   printf("Completed: %d allocs, %d frees\n", allocs, frees);
 }
 
+/**
+ * Simulates a brownout by setting write_state to STATE_WRITING.
+ * This mimics what happens when power fails during a write operation.
+ */
+static void simulate_brownout(uint8_t *heap, void *ptr) {
+  /* Find the header for this payload pointer */
+  uint8_t *scan = heap;
+  size_t min_block = 56;  /* sizeof(Header) + sizeof(Footer) approx */
+  while (scan < heap + MAX_HEAP_SIZE - min_block) {
+    /* Check for header magic (0xDEADBEEF) */
+    uint32_t magic = *(uint32_t *)scan;
+    if (magic == 0xDEADBEEFU) {
+      size_t block_size = *(size_t *)(scan + 8);
+      if (block_size >= min_block && block_size < MAX_HEAP_SIZE) {
+        /* Check if this block's payload matches ptr */
+        uint8_t *data = scan + 32;  /* Skip header */
+        size_t offset = (size_t)(data - heap);
+        size_t padding = (40 - (offset % 40)) % 40;
+        uint8_t *payload = data + padding;
+        if (payload == ptr) {
+          /* Set write_state to STATE_WRITING (0xAAAAAAAA) */
+          /* write_state is at offset 28 in header */
+          uint32_t *write_state = (uint32_t *)(scan + 28);
+          *write_state = 0xAAAAAAAAU;
+          return;
+        }
+        scan += block_size;
+        continue;
+      }
+    }
+    scan += 8;
+  }
+}
+
+/* Runs brownout-specific tests */
+static void run_brownout_tests(uint8_t *heap) {
+  void *ptr;
+  const char *test_data = "Brownout test data";
+  char buf[64];
+  int r;
+  printf("\n=== Brownout Detection Tests ===\n");
+  fflush(stdout);
+  /* Test 1: Detect brownout on read */
+  printf("Test B1: Brownout detection on read... ");
+  fflush(stdout);
+  ptr = mm_malloc(64);
+  if (ptr != NULL) {
+    mm_write(ptr, 0, test_data, strlen(test_data) + 1);
+    /* Simulate brownout by corrupting write_state */
+    simulate_brownout(heap, ptr);
+    r = mm_read(ptr, 0, buf, 10);
+    if (r == -1) {
+      printf("PASS (detected)\n");
+    } else {
+      printf("FAIL (not detected)\n");
+    }
+  } else {
+    printf("FAIL (allocation failed)\n");
+  }
+  /* Test 2: Detect brownout on write */
+  printf("Test B2: Brownout detection on write... ");
+  fflush(stdout);
+  ptr = mm_malloc(64);
+  if (ptr != NULL) {
+    mm_write(ptr, 0, test_data, strlen(test_data) + 1);
+    simulate_brownout(heap, ptr);
+    r = mm_write(ptr, 0, "new data", 8);
+    if (r == -1) {
+      printf("PASS (detected)\n");
+    } else {
+      printf("FAIL (not detected)\n");
+    }
+  } else {
+    printf("FAIL (allocation failed)\n");
+  }
+  /* Test 3: Brownout block is quarantined */
+  printf("Test B3: Brownout quarantine... ");
+  fflush(stdout);
+  ptr = mm_malloc(64);
+  if (ptr != NULL) {
+    mm_write(ptr, 0, test_data, strlen(test_data) + 1);
+    simulate_brownout(heap, ptr);
+    mm_read(ptr, 0, buf, 10);  /* Should fail and quarantine */
+    r = mm_read(ptr, 0, buf, 10);  /* Should fail (quarantined) */
+    if (r == -1) {
+      printf("PASS (quarantined)\n");
+    } else {
+      printf("FAIL (not quarantined)\n");
+    }
+  } else {
+    printf("FAIL (allocation failed)\n");
+  }
+}
+
 /* Runs storm simulation tests */
 static void run_storm_tests(uint8_t *heap, size_t size, int level,
                             unsigned int *seedp) {
@@ -430,6 +524,8 @@ static void run_storm_tests(uint8_t *heap, size_t size, int level,
       printf("Limited (heap may be fragmented)\n");
     }
   }
+  /* Run brownout tests after storm tests */
+  run_brownout_tests(heap);
 }
 
 /* Main entry point for the test executable */

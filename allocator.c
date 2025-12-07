@@ -638,7 +638,10 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
   return (int)len;
 }
 
-/* Writes data to an allocated block */
+/**
+ * Writes data to an allocated block.
+ * Uses three-state commit protocol for brownout detection.
+ */
 int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
   Header *hdr;
   size_t capacity;
@@ -655,6 +658,12 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
   if (is_quarantined(hdr)) {
     return -1;
   }
+  /* Check brownout FIRST - previous write may have been interrupted */
+  if (detect_brownout(hdr)) {
+    quarantine_block(hdr);
+    return -1;
+  }
+  /* Check for radiation corruption */
   if (!validate_block(hdr)) {
     quarantine_block(hdr);
     return -1;
@@ -682,7 +691,11 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
   return (int)len;
 }
 
-/* Frees an allocated block */
+/**
+ * Frees an allocated block.
+ * Detects brownout and radiation corruption before freeing.
+ * Quarantines corrupted blocks instead of adding to free list.
+ */
 void mm_free(void *ptr) {
   Header *hdr;
   uint8_t *data;
@@ -697,10 +710,17 @@ void mm_free(void *ptr) {
   if (is_quarantined(hdr)) {
     return;
   }
+  /* Check brownout FIRST - block may have been written when power failed */
+  if (detect_brownout(hdr)) {
+    quarantine_block(hdr);
+    return;
+  }
+  /* Check for radiation corruption */
   if (!validate_block(hdr)) {
     quarantine_block(hdr);
     return;
   }
+  /* Detect double-free */
   if (hdr->is_alloc == 0) {
     return;
   }
@@ -716,7 +736,10 @@ void mm_free(void *ptr) {
   coalesce_free_blocks();
 }
 
-/* Resizes an allocated block */
+/**
+ * Resizes an allocated block.
+ * Detects brownout and radiation corruption before reallocating.
+ */
 void *mm_realloc(void *ptr, size_t new_size) {
   Header *hdr;
   Header *new_hdr;
@@ -737,6 +760,12 @@ void *mm_realloc(void *ptr, size_t new_size) {
   if (is_quarantined(hdr)) {
     return NULL;
   }
+  /* Check brownout FIRST - block may have been written when power failed */
+  if (detect_brownout(hdr)) {
+    quarantine_block(hdr);
+    return NULL;
+  }
+  /* Check for radiation corruption */
   if (!validate_block(hdr)) {
     quarantine_block(hdr);
     return NULL;
