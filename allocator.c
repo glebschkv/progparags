@@ -865,12 +865,10 @@ void *mm_realloc(void *ptr, size_t new_size) {
   new_hdr = find_block_header(new_ptr);
   if (new_hdr != NULL) {
     new_hdr->write_state = STATE_WRITING;
-    new_hdr->checksum = compute_header_checksum(new_hdr);
   }
   memcpy(new_ptr, ptr, copy_size);
   if (new_hdr != NULL) {
     new_hdr->write_state = STATE_WRITTEN;
-    new_hdr->checksum = compute_header_checksum(new_hdr);
   }
   mm_free(ptr);
   return new_ptr;
