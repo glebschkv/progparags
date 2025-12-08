@@ -383,14 +383,14 @@ static void simulate_brownout(uint8_t *heap, void *ptr) {
       size_t block_size = *(size_t *)(scan + 8);
       if (block_size >= min_block && block_size < MAX_HEAP_SIZE) {
         /* Check if this block's payload matches ptr */
-        uint8_t *data = scan + 32;  /* Skip header */
+        uint8_t *data = scan + 40;  /* Skip header (40 bytes with payload_checksum) */
         size_t offset = (size_t)(data - heap);
         size_t padding = (40 - (offset % 40)) % 40;
         uint8_t *payload = data + padding;
         if (payload == ptr) {
           /* Set write_state to STATE_WRITING (0xAAAAAAAA) */
-          /* write_state is at offset 28 in header */
-          uint32_t *write_state = (uint32_t *)(scan + 28);
+          /* write_state is at offset 32 in header */
+          uint32_t *write_state = (uint32_t *)(scan + 32);
           *write_state = 0xAAAAAAAAU;
           return;
         }
