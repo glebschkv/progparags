@@ -736,7 +736,7 @@ void *mm_malloc(size_t size) {
   init_header(hdr, hdr->size, 1, STATE_UNWRITTEN);
   init_footer(hdr);
   stats_allocated_bytes += hdr->size;
-  /* Fill ENTIRE data area with FREE_PATTERN (including padding before payload) */
+  /* Fill data area with FREE_PATTERN (including padding before payload) */
   {
     uint8_t *data = get_data_area(hdr);
     size_t data_len = hdr->size - sizeof(Header) - sizeof(Footer);
