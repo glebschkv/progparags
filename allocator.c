@@ -583,11 +583,14 @@ void *mm_malloc(size_t size) {
   init_header(hdr, hdr->size, 1, STATE_WRITTEN);  /* VARIANT 2 */
   init_footer(hdr);
   stats_allocated_bytes += hdr->size;
-  /* Fill data area with FREE_PATTERN (including padding before payload) */
+  /* Fill only padding area (between header and aligned payload) with free pattern */
   {
     uint8_t *data = get_data_area(hdr);
-    size_t data_len = hdr->size - sizeof(Header) - sizeof(Footer);
-    fill_free_pattern(data, data_len);
+    uint8_t *payload_ptr = (uint8_t *)get_aligned_payload(hdr);
+    size_t padding_len = payload_ptr - data;
+    if (padding_len > 0) {
+      fill_free_pattern(data, padding_len);
+    }
   }
   payload = get_aligned_payload(hdr);
   return payload;
