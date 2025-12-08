@@ -732,6 +732,15 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     return -1;
   }
   /**
+   * Partial writes are forbidden - every write must use ALL the space.
+   * If the write doesn't completely fill the payload capacity, treat it
+   * as a brownout condition (incomplete write detected).
+   */
+  if (offset != 0 || len != capacity) {
+    quarantine_block(hdr);
+    return -1;
+  }
+  /**
    * Three-state commit protocol for brownout detection:
    * 1. Set state to WRITING before payload modification
    * 2. Perform the actual write and update payload checksum
