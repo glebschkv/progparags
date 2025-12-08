@@ -383,7 +383,8 @@ static void simulate_brownout(uint8_t *heap, void *ptr) {
       size_t block_size = *(size_t *)(scan + 8);
       if (block_size >= min_block && block_size < MAX_HEAP_SIZE) {
         /* Check if this block's payload matches ptr */
-        uint8_t *data = scan + 40;  /* Skip header (40 bytes with payload_checksum) */
+        /* Skip header (40 bytes with payload_checksum) */
+        uint8_t *data = scan + 40;
         size_t offset = (size_t)(data - heap);
         size_t padding = (40 - (offset % 40)) % 40;
         uint8_t *payload = data + padding;
