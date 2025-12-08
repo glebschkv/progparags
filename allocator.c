@@ -68,7 +68,7 @@ typedef struct {
   uint32_t is_alloc;         /* Allocation status: 1 = allocated, 0 = free */
   uint32_t payload_checksum; /* Checksum for payload data integrity */
   uint32_t write_state;      /* Write state for brownout detection */
-  uint32_t requested_size;   /* Requested payload size for partial write check */
+  uint32_t requested_size;   /* Requested payload size for write check */
 } Header;
 
 /**
@@ -480,8 +480,8 @@ static void split_block(Header *hdr, size_t needed) {
     return;
   }
   new_block_size = hdr->size - needed;
-  init_header(hdr, needed, hdr->is_alloc, hdr->write_state, hdr->payload_checksum,
-              hdr->requested_size);
+  init_header(hdr, needed, hdr->is_alloc, hdr->write_state,
+              hdr->payload_checksum, hdr->requested_size);
   init_footer(hdr);
   new_hdr = (Header *)((uint8_t *)hdr + needed);
   /* Fill entire data area with free pattern first */
@@ -613,7 +613,7 @@ void *mm_malloc(size_t size) {
   /* Calculate minimum block size based on THIS block's alignment padding */
   min_block_size = get_min_block_size_for_payload(hdr, size);
   split_block(hdr, min_block_size);
-  /* Fill data area with FREE_PATTERN first (including padding before payload) */
+  /* Fill data area with FREE_PATTERN first (including pre-payload padding) */
   {
     uint8_t *data = get_data_area(hdr);
     size_t data_len = hdr->size - sizeof(Header) - sizeof(Footer);
