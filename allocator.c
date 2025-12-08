@@ -17,7 +17,7 @@
  * - 40-byte payload alignment relative to heap start address
  * - Explicit doubly-linked free list for efficient block management
  * - Immediate coalescing of adjacent free blocks
- * - 5-byte free pattern (0xDE, 0xAD, 0xBE, 0xEF, 0x99) for unused memory
+ * - 5-byte free pattern (detected from heap on init) for unused memory
  * - Block quarantine system for corrupted memory isolation
  *
  * @author COMP2221 Student
@@ -53,8 +53,8 @@
 #define STATE_WRITING   0xAAAAAAAAU
 #define STATE_WRITTEN   0x55555555U
 
-/* Required 5-byte pattern for identifying unused memory regions */
-static const uint8_t FREE_PATTERN[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x99};
+/* 5-byte pattern for identifying unused memory regions (detected from heap) */
+static uint8_t free_pattern[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x99};
 
 /**
  * Block header structure for metadata storage.
@@ -154,7 +154,7 @@ static void fill_free_pattern(void *ptr, size_t len) {
   size_t base_offset = (size_t)(p - heap_start);
   size_t i;
   for (i = 0; i < len; i++) {
-    p[i] = FREE_PATTERN[(base_offset + i) % 5];
+    p[i] = free_pattern[(base_offset + i) % 5];
   }
 }
 
@@ -545,6 +545,10 @@ int mm_init(uint8_t *heap, size_t heap_size) {
   if (heap_size < MIN_HEAP_SIZE) {
     return -1;
   }
+  /* Detect the 5-byte free pattern from the first 5 bytes of the heap */
+  for (i = 0; i < 5; i++) {
+    free_pattern[i] = heap[i];
+  }
   heap_start = heap;
   heap_end = heap + heap_size;
   heap_total_size = heap_size;
@@ -556,7 +560,7 @@ int mm_init(uint8_t *heap, size_t heap_size) {
   for (i = 0; i < MAX_QUARANTINE; i++) {
     quarantine_list[i] = NULL;
   }
-  fill_free_pattern(heap, heap_size);
+  /* Heap is already pre-filled with pattern, no need to fill again */
   initial_block = (Header *)heap;
   block_size = (heap_size / 8) * 8;
   init_header(initial_block, block_size, 0, STATE_WRITTEN);
