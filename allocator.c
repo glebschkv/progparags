@@ -312,6 +312,104 @@ static bool validate_block(Header *hdr) {
 }
 
 /**
+ * Attempts to recover a corrupted block using redundant data.
+ * Uses majority voting on the 4 size copies (header size, header size_backup,
+ * footer size, footer size_backup) to determine the correct size.
+ * Repairs magic numbers, sizes, and recomputes checksums.
+ * Returns true if recovery succeeded, false if block is unrecoverable.
+ */
+static bool try_recover_block(Header *hdr) {
+  Footer *ftr;
+  size_t sizes[4];
+  size_t correct_size = 0;
+  int count;
+  int i;
+  int j;
+
+  /* Basic sanity checks - need valid pointer and reasonable magic */
+  if (!is_within_heap(hdr)) {
+    return false;
+  }
+  if ((uint8_t *)hdr + sizeof(Header) > heap_end) {
+    return false;
+  }
+
+  /* Collect all size values we can find */
+  sizes[0] = hdr->size;
+  sizes[1] = hdr->size_backup;
+
+  /* Try to get footer sizes - need a plausible size first */
+  /* Use majority voting to find the most likely correct size */
+  for (i = 0; i < 2; i++) {
+    if (sizes[i] >= sizeof(Header) + sizeof(Footer) &&
+        sizes[i] <= heap_total_size &&
+        (uint8_t *)hdr + sizes[i] <= heap_end) {
+      /* This size looks plausible, try to read footer */
+      ftr = (Footer *)((uint8_t *)hdr + sizes[i] - sizeof(Footer));
+      if (is_within_heap(ftr) && (uint8_t *)ftr + sizeof(Footer) <= heap_end) {
+        sizes[2] = ftr->size;
+        sizes[3] = ftr->size_backup;
+        break;
+      }
+    }
+  }
+  if (i == 2) {
+    /* Couldn't find a plausible size to locate footer */
+    return false;
+  }
+
+  /* Majority voting: find the size that appears most often */
+  for (i = 0; i < 4; i++) {
+    count = 0;
+    for (j = 0; j < 4; j++) {
+      if (sizes[j] == sizes[i]) {
+        count++;
+      }
+    }
+    /* Need at least 2 agreeing values (majority of 4, or tie-breaker) */
+    if (count >= 2) {
+      correct_size = sizes[i];
+      break;
+    }
+  }
+
+  if (correct_size == 0 ||
+      correct_size < sizeof(Header) + sizeof(Footer) ||
+      correct_size > heap_total_size ||
+      (uint8_t *)hdr + correct_size > heap_end) {
+    return false;
+  }
+
+  /* Get footer using the recovered size */
+  ftr = (Footer *)((uint8_t *)hdr + correct_size - sizeof(Footer));
+  if (!is_within_heap(ftr) || (uint8_t *)ftr + sizeof(Footer) > heap_end) {
+    return false;
+  }
+
+  /* Repair header */
+  hdr->magic = HEADER_MAGIC;
+  hdr->size = correct_size;
+  hdr->size_backup = correct_size;
+  /* Preserve is_alloc if it looks valid, otherwise assume allocated */
+  if (hdr->is_alloc != 0 && hdr->is_alloc != 1) {
+    hdr->is_alloc = 1;
+  }
+  /* Preserve write_state if valid, otherwise set to WRITTEN */
+  if (!is_valid_write_state(hdr->write_state)) {
+    hdr->write_state = STATE_WRITTEN;
+  }
+  hdr->checksum = compute_header_checksum(hdr);
+
+  /* Repair footer */
+  ftr->magic = FOOTER_MAGIC;
+  ftr->size = correct_size;
+  ftr->size_backup = correct_size;
+  ftr->checksum = compute_footer_checksum(ftr);
+
+  return true;
+}
+
+/**
  * Checks for brownout condition (interrupted write).
  * Returns true if the block was being written when power was lost.
  */
@@ -363,20 +461,50 @@ static void free_list_add(Header *hdr) {
   free_list_head = links;
 }
 
-/* Finds the header for a given payload pointer */
+/**
+ * Finds the header for a given payload pointer.
+ * First tries direct calculation from payload address for potentially
+ * corrupted blocks, then falls back to heap scan for valid blocks.
+ */
 static Header *find_block_header(void *payload) {
   uint8_t *scan;
   size_t min_block_size;
+  size_t payload_off;
+  Header *hdr;
+
   if (payload == NULL || !is_initialized) {
     return NULL;
   }
   if (!is_within_heap(payload)) {
     return NULL;
   }
+
+  /* Try direct calculation first - works even if header is corrupted */
+  /* Payload is at header + sizeof(Header) + padding */
+  /* For sizeof(Header)=32 and ALIGNMENT=40, padding is either 8 or 0 */
+  payload_off = (size_t)((uint8_t *)payload - heap_start);
+
+  /* Try with 8 bytes padding (most common case) */
+  if (payload_off >= sizeof(Header) + 8) {
+    hdr = (Header *)(heap_start + payload_off - sizeof(Header) - 8);
+    if (get_aligned_payload(hdr) == payload) {
+      return hdr;
+    }
+  }
+
+  /* Try with 0 bytes padding */
+  if (payload_off >= sizeof(Header)) {
+    hdr = (Header *)(heap_start + payload_off - sizeof(Header));
+    if (get_aligned_payload(hdr) == payload) {
+      return hdr;
+    }
+  }
+
+  /* Fall back to scanning for valid blocks */
   scan = heap_start;
   min_block_size = sizeof(Header) + sizeof(Footer);
   while (scan + min_block_size <= heap_end) {
-    Header *hdr = (Header *)scan;
+    hdr = (Header *)scan;
     if (hdr->magic == HEADER_MAGIC &&
         hdr->size >= min_block_size &&
         hdr->size <= heap_total_size &&
@@ -645,10 +773,14 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
     quarantine_block(hdr);
     return -1;
   }
-  /* Now check for radiation corruption via checksum */
+  /* Check for radiation corruption via checksum */
   if (!validate_block(hdr)) {
-    quarantine_block(hdr);
-    return -1;
+    /* Try to recover using redundant data */
+    if (!try_recover_block(hdr)) {
+      quarantine_block(hdr);
+      return -1;
+    }
+    /* Recovery succeeded - block is now valid */
   }
   if (hdr->is_alloc == 0) {
     return -1;
@@ -691,8 +823,12 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
   }
   /* Check for radiation corruption */
   if (!validate_block(hdr)) {
-    quarantine_block(hdr);
-    return -1;
+    /* Try to recover using redundant data */
+    if (!try_recover_block(hdr)) {
+      quarantine_block(hdr);
+      return -1;
+    }
+    /* Recovery succeeded - block is now valid */
   }
   if (hdr->is_alloc == 0) {
     return -1;
@@ -743,8 +879,12 @@ void mm_free(void *ptr) {
   }
   /* Check for radiation corruption */
   if (!validate_block(hdr)) {
-    quarantine_block(hdr);
-    return;
+    /* Try to recover using redundant data */
+    if (!try_recover_block(hdr)) {
+      quarantine_block(hdr);
+      return;
+    }
+    /* Recovery succeeded - block is now valid */
   }
   /* Detect double-free */
   if (hdr->is_alloc == 0) {
@@ -793,8 +933,12 @@ void *mm_realloc(void *ptr, size_t new_size) {
   }
   /* Check for radiation corruption */
   if (!validate_block(hdr)) {
-    quarantine_block(hdr);
-    return NULL;
+    /* Try to recover using redundant data */
+    if (!try_recover_block(hdr)) {
+      quarantine_block(hdr);
+      return NULL;
+    }
+    /* Recovery succeeded - block is now valid */
   }
   old_capacity = get_payload_capacity(hdr);
   if (new_size <= old_capacity) {
