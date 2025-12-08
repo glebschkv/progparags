@@ -202,7 +202,8 @@ static size_t get_payload_capacity(Header *hdr) {
  * at a specific block position. Takes into account the actual alignment
  * padding required at this position.
  */
-static size_t get_min_block_size_for_payload(Header *hdr, size_t payload_size) {
+static size_t get_min_block_size_for_payload(Header *hdr,
+                                              size_t payload_size) {
   uint8_t *data = get_data_area(hdr);
   size_t offset_from_heap = (size_t)(data - heap_start);
   size_t padding = (ALIGNMENT - (offset_from_heap % ALIGNMENT)) % ALIGNMENT;
@@ -750,7 +751,7 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
    * Partial writes are forbidden - writes must start at offset 0 and
    * write exactly the requested allocation size. This ensures brownout
    * detection works correctly: incomplete writes leave detectable patterns.
-   * Note: We reject but don't quarantine - the block can still be freed/reused.
+   * Note: We reject but don't quarantine - block can still be freed/reused.
    */
   if (offset != 0 || len != hdr->requested_size) {
     return -1;
