@@ -405,7 +405,7 @@ static Header *find_block_header(void *payload) {
   /* Try with 8 bytes padding (most common case) */
   if (payload_off >= sizeof(Header) + 8) {
     hdr = (Header *)(heap_start + payload_off - sizeof(Header) - 8);
-    if (get_aligned_payload(hdr) == payload) {
+    if (hdr->magic == HEADER_MAGIC && get_aligned_payload(hdr) == payload) {
       return hdr;
     }
   }
@@ -413,7 +413,7 @@ static Header *find_block_header(void *payload) {
   /* Try with 0 bytes padding */
   if (payload_off >= sizeof(Header)) {
     hdr = (Header *)(heap_start + payload_off - sizeof(Header));
-    if (get_aligned_payload(hdr) == payload) {
+    if (hdr->magic == HEADER_MAGIC && get_aligned_payload(hdr) == payload) {
       return hdr;
     }
   }
@@ -865,10 +865,12 @@ void *mm_realloc(void *ptr, size_t new_size) {
   new_hdr = find_block_header(new_ptr);
   if (new_hdr != NULL) {
     new_hdr->write_state = STATE_WRITING;
+    new_hdr->checksum = compute_header_checksum(new_hdr);
   }
   memcpy(new_ptr, ptr, copy_size);
   if (new_hdr != NULL) {
     new_hdr->write_state = STATE_WRITTEN;
+    new_hdr->checksum = compute_header_checksum(new_hdr);
   }
   mm_free(ptr);
   return new_ptr;
