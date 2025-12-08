@@ -319,94 +319,12 @@ static bool validate_block(Header *hdr) {
  * Returns true if recovery succeeded, false if block is unrecoverable.
  */
 static bool try_recover_block(Header *hdr) {
-  Footer *ftr;
-  size_t sizes[4];
-  size_t correct_size = 0;
-  int count;
-  int i;
-  int j;
-
-  /* Basic sanity checks - need valid pointer and reasonable magic */
-  if (!is_within_heap(hdr)) {
-    return false;
-  }
-  if ((uint8_t *)hdr + sizeof(Header) > heap_end) {
-    return false;
-  }
-
-  /* Collect all size values we can find */
-  sizes[0] = hdr->size;
-  sizes[1] = hdr->size_backup;
-
-  /* Try to get footer sizes - need a plausible size first */
-  /* Use majority voting to find the most likely correct size */
-  for (i = 0; i < 2; i++) {
-    if (sizes[i] >= sizeof(Header) + sizeof(Footer) &&
-        sizes[i] <= heap_total_size &&
-        (uint8_t *)hdr + sizes[i] <= heap_end) {
-      /* This size looks plausible, try to read footer */
-      ftr = (Footer *)((uint8_t *)hdr + sizes[i] - sizeof(Footer));
-      if (is_within_heap(ftr) && (uint8_t *)ftr + sizeof(Footer) <= heap_end) {
-        sizes[2] = ftr->size;
-        sizes[3] = ftr->size_backup;
-        break;
-      }
-    }
-  }
-  if (i == 2) {
-    /* Couldn't find a plausible size to locate footer */
-    return false;
-  }
-
-  /* Majority voting: find the size that appears most often */
-  for (i = 0; i < 4; i++) {
-    count = 0;
-    for (j = 0; j < 4; j++) {
-      if (sizes[j] == sizes[i]) {
-        count++;
-      }
-    }
-    /* Need at least 2 agreeing values (majority of 4, or tie-breaker) */
-    if (count >= 2) {
-      correct_size = sizes[i];
-      break;
-    }
-  }
-
-  if (correct_size == 0 ||
-      correct_size < sizeof(Header) + sizeof(Footer) ||
-      correct_size > heap_total_size ||
-      (uint8_t *)hdr + correct_size > heap_end) {
-    return false;
-  }
-
-  /* Get footer using the recovered size */
-  ftr = (Footer *)((uint8_t *)hdr + correct_size - sizeof(Footer));
-  if (!is_within_heap(ftr) || (uint8_t *)ftr + sizeof(Footer) > heap_end) {
-    return false;
-  }
-
-  /* Repair header */
-  hdr->magic = HEADER_MAGIC;
-  hdr->size = correct_size;
-  hdr->size_backup = correct_size;
-  /* Preserve is_alloc if it looks valid, otherwise assume allocated */
-  if (hdr->is_alloc != 0 && hdr->is_alloc != 1) {
-    hdr->is_alloc = 1;
-  }
-  /* Preserve write_state if valid, otherwise set to WRITTEN */
-  if (!is_valid_write_state(hdr->write_state)) {
-    hdr->write_state = STATE_WRITTEN;
-  }
-  hdr->checksum = compute_header_checksum(hdr);
-
-  /* Repair footer */
-  ftr->magic = FOOTER_MAGIC;
-  ftr->size = correct_size;
-  ftr->size_backup = correct_size;
-  ftr->checksum = compute_footer_checksum(ftr);
-
-  return true;
+  /*
+   * Per spec: "quarantine suspect blocks rather than reusing/merging them"
+   * Do not attempt recovery - just quarantine corrupted blocks.
+   */
+  (void)hdr;
+  return false;
 }
 
 /**
