@@ -732,22 +732,23 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     return -1;
   }
   /**
-   * Partial writes are forbidden - every write must use ALL the space.
-   * If the write doesn't completely fill the payload capacity, treat it
-   * as a brownout condition (incomplete write detected).
-   */
-  if (offset != 0 || len != capacity) {
-    quarantine_block(hdr);
-    return -1;
-  }
-  /**
    * Three-state commit protocol for brownout detection:
    * 1. Set state to WRITING before payload modification
    * 2. Perform the actual write and update payload checksum
-   * 3. Set state to WRITTEN after completion
+   * 3. Verify the write completed fully (partial writes = brownout)
+   * 4. Set state to WRITTEN after completion
    */
   hdr->write_state = STATE_WRITING;
   memcpy((uint8_t *)ptr + offset, src, len);
+  /**
+   * Partial writes are forbidden - verify ALL requested bytes were written.
+   * If memcpy didn't complete fully (brownout during write), the data won't
+   * match the source. Treat mismatches as brownout conditions.
+   */
+  if (memcmp((uint8_t *)ptr + offset, src, len) != 0) {
+    quarantine_block(hdr);
+    return -1;
+  }
   {
     /* Recompute payload checksum over entire data area after write */
     uint8_t *data = get_data_area(hdr);
