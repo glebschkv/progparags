@@ -727,7 +727,7 @@ void *mm_malloc(size_t size) {
   /* Calculate minimum block size based on THIS block's alignment padding */
   min_block_size = get_min_block_size_for_payload(hdr, size);
   split_block(hdr, min_block_size);
-  init_header(hdr, hdr->size, 1, STATE_UNWRITTEN);
+  init_header(hdr, hdr->size, 1, STATE_WRITTEN);  /* VARIANT 2 */
   init_footer(hdr);
   stats_allocated_bytes += hdr->size;
   /* Fill data area with FREE_PATTERN (including padding before payload) */
