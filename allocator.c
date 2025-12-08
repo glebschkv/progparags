@@ -61,12 +61,14 @@ static uint8_t free_pattern[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x99};
  * Each allocated or free block begins with this header structure.
  */
 typedef struct {
-  uint32_t magic;       /* Magic number for block identification */
-  uint32_t checksum;    /* Rotational checksum for corruption detection */
-  size_t   size;        /* Total block size including header and footer */
-  size_t   size_backup; /* Redundant size copy for corruption detection */
-  uint32_t is_alloc;    /* Allocation status: 1 = allocated, 0 = free */
-  uint32_t write_state; /* Write state for brownout detection */
+  uint32_t magic;            /* Magic number for block identification */
+  uint32_t checksum;         /* Rotational checksum for corruption detection */
+  size_t   size;             /* Total block size including header and footer */
+  size_t   size_backup;      /* Redundant size copy for corruption detection */
+  uint32_t is_alloc;         /* Allocation status: 1 = allocated, 0 = free */
+  uint32_t payload_checksum; /* Checksum for payload data integrity */
+  uint32_t write_state;      /* Write state for brownout detection */
+  uint32_t padding;          /* Padding for 8-byte alignment */
 } Header;
 
 /**
@@ -96,6 +98,19 @@ static uint32_t rotate_left(uint32_t value, int bits) {
 }
 
 /**
+ * Computes checksum for payload data.
+ * Uses a simple but effective rotational checksum over all payload bytes.
+ */
+static uint32_t compute_payload_checksum(const uint8_t *payload, size_t len) {
+  uint32_t cs = 0x12345678U;
+  size_t i;
+  for (i = 0; i < len; i++) {
+    cs = rotate_left(cs, 3) ^ payload[i];
+  }
+  return cs;
+}
+
+/**
  * Computes checksum for a block header.
  * NOTE: write_state is intentionally excluded from checksum computation
  * to allow brownout detection even when checksum appears invalid.
@@ -109,6 +124,7 @@ static uint32_t compute_header_checksum(const Header *hdr) {
   cs = rotate_left(cs, 13) ^ (uint32_t)(hdr->size_backup & 0xFFFFFFFFUL);
   cs = rotate_left(cs, 17) ^ (uint32_t)(hdr->size_backup >> 32);
   cs = rotate_left(cs, 19) ^ hdr->is_alloc;
+  cs = rotate_left(cs, 23) ^ hdr->payload_checksum;
   /* write_state excluded - checked separately for brownout detection */
   return cs;
 }
@@ -324,12 +340,14 @@ static bool detect_brownout(Header *hdr) {
 
 /* Initializes a block header with the specified parameters */
 static void init_header(Header *hdr, size_t block_size, uint32_t allocated,
-                        uint32_t write_state) {
+                        uint32_t write_state, uint32_t payload_cs) {
   hdr->magic = HEADER_MAGIC;
   hdr->size = block_size;
   hdr->size_backup = block_size;
   hdr->is_alloc = allocated;
+  hdr->payload_checksum = payload_cs;
   hdr->write_state = write_state;
+  hdr->padding = 0;
   hdr->checksum = compute_header_checksum(hdr);
 }
 
@@ -454,20 +472,23 @@ static void split_block(Header *hdr, size_t needed) {
   Header *new_hdr;
   uint8_t *data;
   size_t data_len;
+  uint32_t payload_cs;
   min_remainder = sizeof(Header) + MIN_DATA_SIZE + sizeof(Footer);
   if (hdr->size < needed + min_remainder) {
     return;
   }
   new_block_size = hdr->size - needed;
-  init_header(hdr, needed, hdr->is_alloc, hdr->write_state);
+  init_header(hdr, needed, hdr->is_alloc, hdr->write_state, hdr->payload_checksum);
   init_footer(hdr);
   new_hdr = (Header *)((uint8_t *)hdr + needed);
-  init_header(new_hdr, new_block_size, 0, STATE_WRITTEN);
-  init_footer(new_hdr);
-  /* Fill entire data area with free pattern */
-  data = get_data_area(new_hdr);
+  /* Fill entire data area with free pattern first */
+  data = (uint8_t *)new_hdr + sizeof(Header);
   data_len = new_block_size - sizeof(Header) - sizeof(Footer);
   fill_free_pattern(data, data_len);
+  /* Compute payload checksum over data area */
+  payload_cs = compute_payload_checksum(data, data_len);
+  init_header(new_hdr, new_block_size, 0, STATE_WRITTEN, payload_cs);
+  init_footer(new_hdr);
 }
 
 /* Coalesces adjacent free blocks */
@@ -506,13 +527,16 @@ static void coalesce_free_blocks(void) {
       size_t combined_size;
       uint8_t *data;
       size_t data_len;
+      uint32_t payload_cs;
       combined_size = hdr->size + next_hdr->size;
-      init_header(hdr, combined_size, 0, STATE_WRITTEN);
-      init_footer(hdr);
-      /* Fill entire data area with free pattern */
+      /* Fill entire data area with free pattern first */
       data = get_data_area(hdr);
       data_len = combined_size - sizeof(Header) - sizeof(Footer);
       fill_free_pattern(data, data_len);
+      /* Compute payload checksum over data area */
+      payload_cs = compute_payload_checksum(data, data_len);
+      init_header(hdr, combined_size, 0, STATE_WRITTEN, payload_cs);
+      init_footer(hdr);
       continue;
     }
     scan = next_addr;
@@ -547,7 +571,13 @@ int mm_init(uint8_t *heap, size_t heap_size) {
   /* Heap is already pre-filled with pattern by the grader, preserve it */
   initial_block = (Header *)heap;
   block_size = (heap_size / 8) * 8;
-  init_header(initial_block, block_size, 0, STATE_WRITTEN);
+  {
+    /* Compute payload checksum over existing data area */
+    uint8_t *data = (uint8_t *)initial_block + sizeof(Header);
+    size_t data_len = block_size - sizeof(Header) - sizeof(Footer);
+    uint32_t payload_cs = compute_payload_checksum(data, data_len);
+    init_header(initial_block, block_size, 0, STATE_WRITTEN, payload_cs);
+  }
   init_footer(initial_block);
   /* Data area already has free pattern from grader - don't overwrite */
   return 0;
@@ -580,15 +610,18 @@ void *mm_malloc(size_t size) {
   /* Calculate minimum block size based on THIS block's alignment padding */
   min_block_size = get_min_block_size_for_payload(hdr, size);
   split_block(hdr, min_block_size);
-  init_header(hdr, hdr->size, 1, STATE_WRITTEN);  /* VARIANT 2 */
-  init_footer(hdr);
-  stats_allocated_bytes += hdr->size;
-  /* Fill data area with FREE_PATTERN (including padding before payload) */
+  /* Fill data area with FREE_PATTERN first (including padding before payload) */
   {
     uint8_t *data = get_data_area(hdr);
     size_t data_len = hdr->size - sizeof(Header) - sizeof(Footer);
+    uint32_t payload_cs;
     fill_free_pattern(data, data_len);
+    /* Compute payload checksum over data area */
+    payload_cs = compute_payload_checksum(data, data_len);
+    init_header(hdr, hdr->size, 1, STATE_WRITTEN, payload_cs);  /* VARIANT 2 */
   }
+  init_footer(hdr);
+  stats_allocated_bytes += hdr->size;
   payload = get_aligned_payload(hdr);
   return payload;
 }
@@ -631,6 +664,17 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
   }
   if (hdr->is_alloc == 0) {
     return -1;
+  }
+  /* Verify payload data integrity */
+  {
+    uint8_t *data = get_data_area(hdr);
+    size_t data_len = hdr->size - sizeof(Header) - sizeof(Footer);
+    uint32_t computed_cs = compute_payload_checksum(data, data_len);
+    if (computed_cs != hdr->payload_checksum) {
+      /* Payload corruption detected - quarantine block */
+      quarantine_block(hdr);
+      return -1;
+    }
   }
   capacity = get_payload_capacity(hdr);
   if (offset >= capacity) {
@@ -690,12 +734,18 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
   /**
    * Three-state commit protocol for brownout detection:
    * 1. Set state to WRITING before payload modification
-   * 2. Perform the actual write
+   * 2. Perform the actual write and update payload checksum
    * 3. Set state to WRITTEN after completion
-   * Note: checksum doesn't include write_state, so no update needed
    */
   hdr->write_state = STATE_WRITING;
   memcpy((uint8_t *)ptr + offset, src, len);
+  {
+    /* Recompute payload checksum over entire data area after write */
+    uint8_t *data = get_data_area(hdr);
+    size_t data_len = hdr->size - sizeof(Header) - sizeof(Footer);
+    hdr->payload_checksum = compute_payload_checksum(data, data_len);
+    hdr->checksum = compute_header_checksum(hdr);
+  }
   hdr->write_state = STATE_WRITTEN;
   return (int)len;
 }
@@ -738,12 +788,16 @@ void mm_free(void *ptr) {
     return;
   }
   stats_allocated_bytes -= hdr->size;
-  init_header(hdr, hdr->size, 0, STATE_WRITTEN);
-  init_footer(hdr);
-  /* Fill entire data area with free pattern */
+  /* Fill entire data area with free pattern first */
   data = get_data_area(hdr);
   data_len = hdr->size - sizeof(Header) - sizeof(Footer);
   fill_free_pattern(data, data_len);
+  {
+    /* Compute payload checksum over data area */
+    uint32_t payload_cs = compute_payload_checksum(data, data_len);
+    init_header(hdr, hdr->size, 0, STATE_WRITTEN, payload_cs);
+  }
+  init_footer(hdr);
   coalesce_free_blocks();
 }
 
@@ -801,6 +855,11 @@ void *mm_realloc(void *ptr, size_t new_size) {
   }
   memcpy(new_ptr, ptr, copy_size);
   if (new_hdr != NULL) {
+    /* Recompute payload checksum over entire data area after copy */
+    uint8_t *data = get_data_area(new_hdr);
+    size_t data_len = new_hdr->size - sizeof(Header) - sizeof(Footer);
+    new_hdr->payload_checksum = compute_payload_checksum(data, data_len);
+    new_hdr->checksum = compute_header_checksum(new_hdr);
     new_hdr->write_state = STATE_WRITTEN;
   }
   mm_free(ptr);
