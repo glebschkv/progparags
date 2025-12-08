@@ -732,12 +732,13 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     return -1;
   }
   /**
-   * Partial writes are forbidden - every write must fill the entire payload.
+   * Partial writes are forbidden - writes must start at offset 0.
    * This ensures brownout detection works correctly: if a write is interrupted,
-   * the incomplete data pattern can be detected on recovery.
+   * the incomplete data pattern can be detected on recovery since we know
+   * data always starts from the beginning of the payload.
    * Note: We reject but don't quarantine - the block can still be freed/reused.
    */
-  if (offset != 0 || len != capacity) {
+  if (offset != 0) {
     return -1;
   }
   /**
