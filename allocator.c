@@ -68,7 +68,7 @@ typedef struct {
   uint32_t is_alloc;         /* Allocation status: 1 = allocated, 0 = free */
   uint32_t payload_checksum; /* Checksum for payload data integrity */
   uint32_t write_state;      /* Write state for brownout detection */
-  uint32_t padding;          /* Padding for 8-byte alignment */
+  uint32_t requested_size;   /* Requested payload size for partial write check */
 } Header;
 
 /**
@@ -125,6 +125,7 @@ static uint32_t compute_header_checksum(const Header *hdr) {
   cs = rotate_left(cs, 17) ^ (uint32_t)(hdr->size_backup >> 32);
   cs = rotate_left(cs, 19) ^ hdr->is_alloc;
   cs = rotate_left(cs, 23) ^ hdr->payload_checksum;
+  cs = rotate_left(cs, 29) ^ hdr->requested_size;
   /* write_state excluded - checked separately for brownout detection */
   return cs;
 }
@@ -340,14 +341,15 @@ static bool detect_brownout(Header *hdr) {
 
 /* Initializes a block header with the specified parameters */
 static void init_header(Header *hdr, size_t block_size, uint32_t allocated,
-                        uint32_t write_state, uint32_t payload_cs) {
+                        uint32_t write_state, uint32_t payload_cs,
+                        uint32_t req_size) {
   hdr->magic = HEADER_MAGIC;
   hdr->size = block_size;
   hdr->size_backup = block_size;
   hdr->is_alloc = allocated;
   hdr->payload_checksum = payload_cs;
   hdr->write_state = write_state;
-  hdr->padding = 0;
+  hdr->requested_size = req_size;
   hdr->checksum = compute_header_checksum(hdr);
 }
 
@@ -478,7 +480,8 @@ static void split_block(Header *hdr, size_t needed) {
     return;
   }
   new_block_size = hdr->size - needed;
-  init_header(hdr, needed, hdr->is_alloc, hdr->write_state, hdr->payload_checksum);
+  init_header(hdr, needed, hdr->is_alloc, hdr->write_state, hdr->payload_checksum,
+              hdr->requested_size);
   init_footer(hdr);
   new_hdr = (Header *)((uint8_t *)hdr + needed);
   /* Fill entire data area with free pattern first */
@@ -487,7 +490,7 @@ static void split_block(Header *hdr, size_t needed) {
   fill_free_pattern(data, data_len);
   /* Compute payload checksum over data area */
   payload_cs = compute_payload_checksum(data, data_len);
-  init_header(new_hdr, new_block_size, 0, STATE_WRITTEN, payload_cs);
+  init_header(new_hdr, new_block_size, 0, STATE_WRITTEN, payload_cs, 0);
   init_footer(new_hdr);
 }
 
@@ -535,7 +538,7 @@ static void coalesce_free_blocks(void) {
       fill_free_pattern(data, data_len);
       /* Compute payload checksum over data area */
       payload_cs = compute_payload_checksum(data, data_len);
-      init_header(hdr, combined_size, 0, STATE_WRITTEN, payload_cs);
+      init_header(hdr, combined_size, 0, STATE_WRITTEN, payload_cs, 0);
       init_footer(hdr);
       continue;
     }
@@ -576,7 +579,7 @@ int mm_init(uint8_t *heap, size_t heap_size) {
     uint8_t *data = (uint8_t *)initial_block + sizeof(Header);
     size_t data_len = block_size - sizeof(Header) - sizeof(Footer);
     uint32_t payload_cs = compute_payload_checksum(data, data_len);
-    init_header(initial_block, block_size, 0, STATE_WRITTEN, payload_cs);
+    init_header(initial_block, block_size, 0, STATE_WRITTEN, payload_cs, 0);
   }
   init_footer(initial_block);
   /* Data area already has free pattern from grader - don't overwrite */
@@ -618,7 +621,8 @@ void *mm_malloc(size_t size) {
     fill_free_pattern(data, data_len);
     /* Compute payload checksum over data area */
     payload_cs = compute_payload_checksum(data, data_len);
-    init_header(hdr, hdr->size, 1, STATE_WRITTEN, payload_cs);  /* VARIANT 2 */
+    /* Store requested size for partial write detection */
+    init_header(hdr, hdr->size, 1, STATE_WRITTEN, payload_cs, (uint32_t)size);
   }
   init_footer(hdr);
   stats_allocated_bytes += hdr->size;
@@ -724,6 +728,17 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
   if (hdr->is_alloc == 0) {
     return -1;
   }
+  /* Verify payload data integrity before writing */
+  {
+    uint8_t *data = get_data_area(hdr);
+    size_t data_len = hdr->size - sizeof(Header) - sizeof(Footer);
+    uint32_t computed_cs = compute_payload_checksum(data, data_len);
+    if (computed_cs != hdr->payload_checksum) {
+      /* Payload corruption detected - quarantine block */
+      quarantine_block(hdr);
+      return -1;
+    }
+  }
   capacity = get_payload_capacity(hdr);
   if (offset >= capacity) {
     return -1;
@@ -732,13 +747,12 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     return -1;
   }
   /**
-   * Partial writes are forbidden - writes must start at offset 0.
-   * This ensures brownout detection works correctly: if a write is interrupted,
-   * the incomplete data pattern can be detected on recovery since we know
-   * data always starts from the beginning of the payload.
+   * Partial writes are forbidden - writes must start at offset 0 and
+   * write exactly the requested allocation size. This ensures brownout
+   * detection works correctly: incomplete writes leave detectable patterns.
    * Note: We reject but don't quarantine - the block can still be freed/reused.
    */
-  if (offset != 0) {
+  if (offset != 0 || len != hdr->requested_size) {
     return -1;
   }
   /**
@@ -805,7 +819,7 @@ void mm_free(void *ptr) {
   {
     /* Compute payload checksum over data area */
     uint32_t payload_cs = compute_payload_checksum(data, data_len);
-    init_header(hdr, hdr->size, 0, STATE_WRITTEN, payload_cs);
+    init_header(hdr, hdr->size, 0, STATE_WRITTEN, payload_cs, 0);
   }
   init_footer(hdr);
   coalesce_free_blocks();
